@@ -142,7 +142,7 @@ export async function GET(req: NextRequest) {
 
     // 15m OB: skip in hourly mode. KXBTCD OB fetched after market selection (ticker not known yet).
     const ob15mTicker = markets.length > 0 ? markets[0].ticker : null
-    const ob15mPath   = ob15mTicker ? `/trade-api/v2/markets/${ob15mTicker}/orderbook` : null
+    const ob15mPath   = ob15mTicker ? `/trade-api/v2/markets/${encodeURIComponent(ob15mTicker)}/orderbook` : null
 
     // Coinbase candles format: [time_s, low, high, open, close, vol] newest-first
     // granularity=900→15m, 60→1m, 3600→1h, 14400→4h
@@ -316,7 +316,7 @@ export async function GET(req: NextRequest) {
         console.log(`[pipeline] KXBTCD: selected ${kxbtcdMarket.ticker} from ${kxbtcdMarkets.length} strikes (vol=${kxbtcdMarket.volume.toFixed(0)} oi=${kxbtcdMarket.open_interest.toFixed(0)})`)
 
         // Fetch KXBTCD orderbook for the selected market (overrides 15m OB in hourly mode)
-        const kxbtcdObPath = `/trade-api/v2/markets/${kxbtcdMarket.ticker}/orderbook`
+        const kxbtcdObPath = `/trade-api/v2/markets/${encodeURIComponent(kxbtcdMarket.ticker)}/orderbook`
         const kxbtcdObRes = await fetch(
           `${KALSHI_HOST}${kxbtcdObPath}`,
           { headers: { ...buildKalshiHeaders('GET', kxbtcdObPath), Accept: 'application/json' }, cache: 'no-store' }

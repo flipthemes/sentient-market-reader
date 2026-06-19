@@ -2,13 +2,71 @@
  * Kalshi Portfolio / Trading API
  * ────────────────────────────────
  * Authenticated endpoints (RSA-PSS signed).
- * All prices are in cents (1–99).
+ * Order mutations use V2 event-order endpoints (/portfolio/events/orders).
+ * Prices in app code remain cents (1–99); V2 API uses dollar strings on YES book.
  */
 
+import { randomUUID } from 'crypto'
 import { buildKalshiHeaders } from './kalshi-auth'
 import type { KalshiBalance, KalshiPosition, KalshiOrder, KalshiFill } from './types'
 import { normalizeKalshiPosition, normalizeKalshiOrder, normalizeKalshiFill } from './types'
 import { KALSHI_BASE } from './kalshi'
+
+const ORDERS_V2 = '/trade-api/v2/portfolio/events/orders'
+
+function fpCount(n: number): string {
+  return n.toFixed(2)
+}
+
+function fpDollars(cents: number): string {
+  return (cents / 100).toFixed(4)
+}
+
+/** Map yes/no leg + buy/sell + limit (cents) → V2 bid/ask + dollar price on YES book. */
+function toV2Book(
+  leg: 'yes' | 'no',
+  action: 'buy' | 'sell',
+  priceCents: number,
+): { side: 'bid' | 'ask'; price: string } {
+  if (leg === 'yes') {
+    return { side: action === 'buy' ? 'bid' : 'ask', price: fpDollars(priceCents) }
+  }
+  const comp = fpDollars(100 - priceCents)
+  return { side: action === 'buy' ? 'ask' : 'bid', price: comp }
+}
+
+function mapV2CreateToOrder(
+  data: Record<string, unknown>,
+  ctx: {
+    ticker: string
+    leg: 'yes' | 'no'
+    action: 'buy' | 'sell'
+    count: number
+    priceCents: number
+    clientOrderId: string
+  },
+): KalshiOrder {
+  const fill      = parseFloat(String(data.fill_count ?? 0))
+  const remaining = parseFloat(String(data.remaining_count ?? ctx.count))
+  const status: KalshiOrder['status'] =
+    remaining <= 0 && fill > 0 ? 'executed' : remaining > 0 ? 'resting' : 'pending'
+  const yesPrice = ctx.leg === 'yes' ? ctx.priceCents : 100 - ctx.priceCents
+  return {
+    order_id:        String(data.order_id ?? ''),
+    ticker:          ctx.ticker,
+    side:            ctx.leg,
+    action:          ctx.action,
+    count:           ctx.count,
+    fill_count:      fill,
+    remaining_count: remaining,
+    initial_count:   ctx.count,
+    yes_price:       yesPrice,
+    no_price:        100 - yesPrice,
+    status,
+    created_time:    new Date().toISOString(),
+    client_order_id: String(data.client_order_id ?? ctx.clientOrderId),
+  }
+}
 
 /** Safely extract a string error message from a Kalshi API response body.
  *  Kalshi sometimes returns error as an object: {code, message, details}.
@@ -50,25 +108,30 @@ export interface PlaceOrderResult {
 }
 
 export async function placeOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
-  const path = '/trade-api/v2/portfolio/orders'
+  const priceCents = params.side === 'yes' ? params.yesPrice : params.noPrice
+  if (priceCents === undefined || priceCents <= 0) {
+    return { ok: false, error: 'Missing price: provide yesPrice or noPrice in cents' }
+  }
+
+  const clientOrderId = params.clientOrderId ?? randomUUID()
+  const { side, price } = toV2Book(params.side, 'buy', priceCents)
   const body = {
-    ticker: params.ticker,
-    side: params.side,
-    action: 'buy',
-    count: params.count,
-    ...(params.yesPrice !== undefined ? { yes_price: params.yesPrice } : {}),
-    ...(params.noPrice  !== undefined ? { no_price:  params.noPrice  } : {}),
-    time_in_force: params.ioc ? 'immediate_or_cancel' : 'good_till_canceled',
-    ...(params.clientOrderId ? { client_order_id: params.clientOrderId } : {}),
+    ticker:                     params.ticker,
+    client_order_id:            clientOrderId,
+    side,
+    count:                      fpCount(params.count),
+    price,
+    time_in_force:              params.ioc ? 'immediate_or_cancel' : 'good_till_canceled',
+    self_trade_prevention_type: 'taker_at_cross',
   }
 
   try {
-    const headers = buildKalshiHeaders('POST', path)
+    const headers = buildKalshiHeaders('POST', ORDERS_V2)
     if (!headers['KALSHI-ACCESS-KEY']) {
       return { ok: false, error: 'Missing Kalshi credentials' }
     }
 
-    const res = await fetch(`${KALSHI_BASE}/portfolio/orders`, {
+    const res = await fetch(`${KALSHI_BASE}/portfolio/events/orders`, {
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -78,7 +141,17 @@ export async function placeOrder(params: PlaceOrderParams): Promise<PlaceOrderRe
     if (!res.ok) {
       return { ok: false, error: extractError(data, res.status) }
     }
-    return { ok: true, order: normalizeKalshiOrder(data.order) }
+    return {
+      ok: true,
+      order: mapV2CreateToOrder(data as Record<string, unknown>, {
+        ticker: params.ticker,
+        leg: params.side,
+        action: 'buy',
+        count: params.count,
+        priceCents,
+        clientOrderId,
+      }),
+    }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
@@ -90,32 +163,44 @@ export interface SellOrderParams {
   count: number
 }
 
-/** Market-sell contracts at the best available price (price=1 accepts any bid). */
+/** Market-sell contracts at the best available price (price=1¢ accepts any bid). */
 export async function sellOrder(params: SellOrderParams): Promise<PlaceOrderResult> {
-  const path = '/trade-api/v2/portfolio/orders'
+  const priceCents = 1
+  const clientOrderId = randomUUID()
+  const { side, price } = toV2Book(params.side, 'sell', priceCents)
   const body = {
-    ticker: params.ticker,
-    side: params.side,
-    action: 'sell',
-    count: params.count,
-    // Price of 1¢ means "accept any bid" — effectively a market sell
-    ...(params.side === 'yes' ? { yes_price: 1 } : { no_price: 1 }),
-    time_in_force: 'immediate_or_cancel',
+    ticker:                     params.ticker,
+    client_order_id:            clientOrderId,
+    side,
+    count:                      fpCount(params.count),
+    price,
+    time_in_force:              'immediate_or_cancel',
+    self_trade_prevention_type: 'taker_at_cross',
   }
 
   try {
-    const headers = buildKalshiHeaders('POST', path)
+    const headers = buildKalshiHeaders('POST', ORDERS_V2)
     if (!headers['KALSHI-ACCESS-KEY']) {
       return { ok: false, error: 'Missing Kalshi credentials' }
     }
-    const res = await fetch(`${KALSHI_BASE}/portfolio/orders`, {
+    const res = await fetch(`${KALSHI_BASE}/portfolio/events/orders`, {
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
     const data = await res.json()
     if (!res.ok) return { ok: false, error: extractError(data, res.status) }
-    return { ok: true, order: normalizeKalshiOrder(data.order) }
+    return {
+      ok: true,
+      order: mapV2CreateToOrder(data as Record<string, unknown>, {
+        ticker: params.ticker,
+        leg: params.side,
+        action: 'sell',
+        count: params.count,
+        priceCents,
+        clientOrderId,
+      }),
+    }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
@@ -123,39 +208,52 @@ export async function sellOrder(params: SellOrderParams): Promise<PlaceOrderResu
 
 /** Limit-sell contracts at 99¢ (GTC) — rests until someone pays 99¢, i.e. take-profit at max value. */
 export async function limitSellOrder(params: SellOrderParams): Promise<PlaceOrderResult> {
-  const path = '/trade-api/v2/portfolio/orders'
+  const priceCents = 99
+  const clientOrderId = randomUUID()
+  const { side, price } = toV2Book(params.side, 'sell', priceCents)
   const body = {
-    ticker: params.ticker,
-    side: params.side,
-    action: 'sell',
-    count: params.count,
-    ...(params.side === 'yes' ? { yes_price: 99 } : { no_price: 99 }),
-    time_in_force: 'good_till_canceled',
+    ticker:                     params.ticker,
+    client_order_id:            clientOrderId,
+    side,
+    count:                      fpCount(params.count),
+    price,
+    time_in_force:              'good_till_canceled',
+    self_trade_prevention_type: 'taker_at_cross',
   }
 
   try {
-    const headers = buildKalshiHeaders('POST', path)
+    const headers = buildKalshiHeaders('POST', ORDERS_V2)
     if (!headers['KALSHI-ACCESS-KEY']) {
       return { ok: false, error: 'Missing Kalshi credentials' }
     }
-    const res = await fetch(`${KALSHI_BASE}/portfolio/orders`, {
+    const res = await fetch(`${KALSHI_BASE}/portfolio/events/orders`, {
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
     const data = await res.json()
     if (!res.ok) return { ok: false, error: extractError(data, res.status) }
-    return { ok: true, order: normalizeKalshiOrder(data.order) }
+    return {
+      ok: true,
+      order: mapV2CreateToOrder(data as Record<string, unknown>, {
+        ticker: params.ticker,
+        leg: params.side,
+        action: 'sell',
+        count: params.count,
+        priceCents,
+        clientOrderId,
+      }),
+    }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
 }
 
 export async function cancelOrder(orderId: string): Promise<{ ok: boolean; error?: string }> {
-  const path = `/trade-api/v2/portfolio/orders/${orderId}`
+  const path = `/trade-api/v2/portfolio/events/orders/${encodeURIComponent(orderId)}`
   try {
     const headers = buildKalshiHeaders('DELETE', path)
-    const res = await fetch(`${KALSHI_BASE}/portfolio/orders/${orderId}`, {
+    const res = await fetch(`${KALSHI_BASE}/portfolio/events/orders/${encodeURIComponent(orderId)}`, {
       method: 'DELETE',
       headers,
     })

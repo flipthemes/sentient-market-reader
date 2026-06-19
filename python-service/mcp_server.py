@@ -19,7 +19,7 @@ Register in ~/.claude/settings.json:
   }
 """
 
-import asyncio, json, math, os, sys, time, base64, hashlib, logging
+import asyncio, json, math, os, sys, time, base64, hashlib, logging, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -101,6 +101,13 @@ async def _kalshi_post(path: str, body: dict) -> dict:
         r = await client.post(f"{KALSHI_BASE}{path}", json=body, headers=headers)
         r.raise_for_status()
         return r.json()
+
+
+def _v2_book(leg: str, action: str, price_cents: int) -> tuple[str, str]:
+    if leg == "yes":
+        return ("bid" if action == "buy" else "ask", f"{price_cents / 100:.4f}")
+    comp = (100 - price_cents) / 100
+    return ("ask" if action == "buy" else "bid", f"{comp:.4f}")
 
 
 async def _next_get(path: str) -> dict:
@@ -460,29 +467,28 @@ async def _dispatch(name: str, args: dict) -> Any:
         if limit_price <= 0 or limit_price >= 100:
             return {"error": "limit_price must be 1–99 cents"}
 
-        path = "/portfolio/orders"
+        v2_side, price = _v2_book(side, "buy", limit_price)
         body = {
-            "ticker":      ticker,
-            "action":      "buy",
-            "side":        side,
-            "type":        "limit",
-            "count":       contracts,
-            "yes_price":   limit_price if side == "yes" else (100 - limit_price),
-            "no_price":    limit_price if side == "no"  else (100 - limit_price),
+            "ticker":                     ticker,
+            "client_order_id":            str(uuid.uuid4()),
+            "side":                       v2_side,
+            "count":                      f"{contracts:.2f}",
+            "price":                      price,
+            "time_in_force":              "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
 
         try:
-            result = await _kalshi_post(path, {"order": body})
-            order  = result.get("order", result)
+            result = await _kalshi_post("/portfolio/events/orders", body)
             return {
                 "status":     "placed",
-                "order_id":   order.get("order_id") or order.get("id"),
+                "order_id":   result.get("order_id"),
                 "ticker":     ticker,
                 "side":       side,
                 "contracts":  contracts,
                 "limit_price": limit_price,
                 "estimated_cost": round(contracts * (limit_price / 100 + MAKER_FEE_RATE * (limit_price/100) * (1 - limit_price/100)), 2),
-                "raw":        order,
+                "raw":        result,
             }
         except httpx.HTTPStatusError as e:
             return {"error": f"Kalshi API error {e.response.status_code}: {e.response.text}"}
@@ -540,9 +546,9 @@ async def _dispatch(name: str, args: dict) -> Any:
     elif name == "cancel_order":
         order_id = args["order_id"]
         try:
-            headers = _build_kalshi_headers("DELETE", f"/portfolio/orders/{order_id}")
+            headers = _build_kalshi_headers("DELETE", f"/portfolio/events/orders/{order_id}")
             async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.delete(f"{KALSHI_BASE}/portfolio/orders/{order_id}", headers=headers)
+                r = await client.delete(f"{KALSHI_BASE}/portfolio/events/orders/{order_id}", headers=headers)
                 r.raise_for_status()
             return {"status": "cancelled", "order_id": order_id}
         except Exception as e:

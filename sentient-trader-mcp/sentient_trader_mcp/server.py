@@ -11,7 +11,7 @@ Set credentials before running:
 Or put them in ~/.sentient-trader/config.env
 """
 
-import asyncio, base64, json, math, os, time
+import asyncio, base64, json, math, os, time, uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -228,6 +228,12 @@ async def _kpost(path: str, body: dict) -> dict:
         r = await c.post(f"{KALSHI_BASE}{path}", json=body, headers=_headers("POST", path))
         r.raise_for_status()
         return r.json()
+
+def _v2_book(leg: str, action: str, price_cents: int) -> tuple[str, str]:
+    if leg == "yes":
+        return ("bid" if action == "buy" else "ask", f"{price_cents / 100:.4f}")
+    comp = (100 - price_cents) / 100
+    return ("ask" if action == "buy" else "bid", f"{comp:.4f}")
 
 # ── Market normalization ───────────────────────────────────────────────────────
 def _norm_market(m: dict) -> dict:
@@ -534,18 +540,21 @@ async def _dispatch(name: str, args: dict) -> Any:
         side_cap = MAX_ENTRY_PRICE_YES if side == "yes" else MAX_ENTRY_PRICE_NO
         if limit_price > side_cap:
             return {"error": f"BLOCKED: {limit_price}¢ > {'YES' if side == 'yes' else 'NO'} cap {side_cap}¢ — run analyze_signal first and only place if approved=true"}
+        v2_side, price = _v2_book(side, "buy", limit_price)
         body = {
-            "ticker": ticker, "action": "buy", "side": side, "type": "limit",
-            "count": contracts,
-            "yes_price": limit_price if side == "yes" else (100 - limit_price),
-            "no_price":  limit_price if side == "no"  else (100 - limit_price),
+            "ticker":                     ticker,
+            "client_order_id":            str(uuid.uuid4()),
+            "side":                       v2_side,
+            "count":                      f"{contracts:.2f}",
+            "price":                      price,
+            "time_in_force":              "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
         try:
-            result = await _kpost("/portfolio/orders", {"order": body})
-            order  = result.get("order", result)
+            result = await _kpost("/portfolio/events/orders", body)
             return {
                 "status":     "placed",
-                "order_id":   order.get("order_id") or order.get("id"),
+                "order_id":   result.get("order_id"),
                 "ticker":     ticker,
                 "side":       side,
                 "contracts":  contracts,
@@ -582,7 +591,7 @@ async def _dispatch(name: str, args: dict) -> Any:
 
     elif name == "cancel_order":
         order_id = args["order_id"]
-        path = f"/portfolio/orders/{order_id}"
+        path = f"/portfolio/events/orders/{order_id}"
         hdrs = _headers("DELETE", path)
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.delete(f"{KALSHI_BASE}{path}", headers=hdrs)

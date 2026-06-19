@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { buildKalshiHeaders } from '@/lib/kalshi-auth'
 import { KALSHI_HOST, MONTHS_ET, getETParts } from '@/lib/kalshi'
+import { normalizeKalshiMarket } from '@/lib/types'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -47,12 +48,15 @@ export async function GET() {
     computedTickerMarkets: {
       status: computedRes?.status,
       count: computedData?.markets?.length ?? 0,
-      sample: (computedData?.markets ?? []).slice(0, 3).map((m: Record<string, unknown>) => ({
-        ticker: m.ticker,
-        status: m.status,
-        yes_ask: m.yes_ask,
-        close_time: m.close_time,
-      })),
+      sample: (computedData?.markets ?? []).slice(0, 3).map((m: Record<string, unknown>) => {
+        const norm = normalizeKalshiMarket(m)
+        return {
+          ticker: norm.ticker,
+          status: norm.status,
+          yes_ask: norm.yes_ask,
+          close_time: norm.close_time,
+        }
+      }),
     },
     openEvents: {
       status: eventsRes?.status,
