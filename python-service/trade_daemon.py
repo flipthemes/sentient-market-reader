@@ -12,10 +12,11 @@ Usage:
   python3 trade_daemon.py --bankroll 500
 """
 
-import argparse, asyncio, base64, json, logging, math, os, sys, time
+import argparse, asyncio, base64, json, logging, math, os, sys, time, uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -37,7 +38,8 @@ if _env_path.exists():
             k, _, v = line.partition("=")
             os.environ.setdefault(k.strip(), v.strip())
 
-KALSHI_BASE    = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_HOST    = "https://api.elections.kalshi.com"
+API_PREFIX     = "/trade-api/v2"
 KALSHI_API_KEY = os.environ.get("KALSHI_API_KEY", "")
 KALSHI_PEM     = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private.pem")
 
@@ -63,17 +65,38 @@ def _make_logger() -> logging.Logger:
 
 log = _make_logger()
 
-# ── Kalshi auth ────────────────────────────────────────────────────────────────
-def _build_headers(method: str, path: str) -> dict:
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding as _pad
+# ── Kalshi v2 auth + HTTP ──────────────────────────────────────────────────────
+def _sign_path(endpoint: str) -> str:
+    """Full URL path for RSA signing — includes /trade-api/v2, no query string."""
+    path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+    if not path.startswith(API_PREFIX):
+        path = API_PREFIX + path
+    return path.split("?")[0]
+
+def _api_url(endpoint: str) -> str:
+    path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+    if not path.startswith(API_PREFIX):
+        path = API_PREFIX + path
+    return f"{KALSHI_HOST}{path}"
+
+def _load_private_key():
+    from cryptography.hazmat.primitives import serialization
+    pem_env = os.environ.get("KALSHI_PRIVATE_KEY", "")
+    if pem_env:
+        return serialization.load_pem_private_key(pem_env.replace("\\n", "\n").encode(), password=None)
     key_path = Path(KALSHI_PEM)
     if not key_path.is_absolute():
         key_path = Path(__file__).parent.parent / KALSHI_PEM
-    pk  = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
-    ts  = str(int(time.time() * 1000))
-    sig = pk.sign(
-        (ts + method.upper() + path).encode(),
+    return serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+
+def _build_headers(method: str, endpoint: str) -> dict:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding as _pad
+    pk        = _load_private_key()
+    ts        = str(int(time.time() * 1000))
+    sign_path = _sign_path(endpoint)
+    sig       = pk.sign(
+        (ts + method.upper() + sign_path).encode(),
         _pad.PSS(mgf=_pad.MGF1(hashes.SHA256()), salt_length=_pad.PSS.DIGEST_LENGTH),
         hashes.SHA256(),
     )
@@ -81,22 +104,43 @@ def _build_headers(method: str, path: str) -> dict:
         "KALSHI-ACCESS-KEY":       KALSHI_API_KEY,
         "KALSHI-ACCESS-TIMESTAMP": ts,
         "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
-        "Content-Type": "application/json",
+        "Accept":                  "application/json",
+        "Content-Type":            "application/json",
     }
 
-async def _kget(path: str, params: dict = {}) -> dict:
-    hdrs = _build_headers("GET", path)
+async def _kget(endpoint: str, params: Optional[dict] = None) -> dict:
     async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{KALSHI_BASE}{path}", params=params, headers=hdrs)
+        r = await c.get(_api_url(endpoint), params=params or {}, headers=_build_headers("GET", endpoint))
         r.raise_for_status()
         return r.json()
 
-async def _kpost(path: str, body: dict) -> dict:
-    hdrs = _build_headers("POST", path)
+async def _kpost(endpoint: str, body: dict) -> dict:
     async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(f"{KALSHI_BASE}{path}", json=body, headers=hdrs)
+        r = await c.post(_api_url(endpoint), json=body, headers=_build_headers("POST", endpoint))
         r.raise_for_status()
         return r.json()
+
+def _norm_market(m: dict) -> dict:
+    """v2 API returns yes_ask_dollars (USD string) — normalize to integer cents."""
+    for field, dollar_field in [
+        ("yes_ask", "yes_ask_dollars"), ("yes_bid", "yes_bid_dollars"),
+        ("no_ask",  "no_ask_dollars"),  ("no_bid",  "no_bid_dollars"),
+    ]:
+        if not m.get(field) and m.get(dollar_field) is not None:
+            try:
+                m[field] = round(float(m[dollar_field]) * 100)
+            except (ValueError, TypeError):
+                pass
+    return m
+
+def _v2_book(leg: str, action: str, price_cents: int) -> tuple[str, str]:
+    """Map yes/no leg + buy/sell + cents → V2 bid/ask + dollar price on YES book."""
+    if leg == "yes":
+        side = "bid" if action == "buy" else "ask"
+        return side, f"{price_cents / 100:.4f}"
+    comp = (100 - price_cents) / 100
+    side = "ask" if action == "buy" else "bid"
+    return side, f"{comp:.4f}"
 
 # ── Timing helpers ─────────────────────────────────────────────────────────────
 def _et_offset() -> int:
@@ -180,6 +224,7 @@ async def fetch_market() -> Optional[dict]:
         try:
             data = await _kget("/markets", {"event_ticker": event, "status": "open"})
             for m in data.get("markets", []):
+                m = _norm_market(m)
                 if m.get("yes_ask", 0) > 0:
                     return m
         except Exception:
@@ -188,7 +233,7 @@ async def fetch_market() -> Optional[dict]:
     # Fallback: grab first open market in series
     try:
         data = await _kget("/markets", {"series_ticker": "KXBTC15M", "status": "open", "limit": 5})
-        active = [m for m in data.get("markets", []) if m.get("yes_ask", 0) > 0]
+        active = [m for m in (_norm_market(x) for x in data.get("markets", [])) if m.get("yes_ask", 0) > 0]
         if active:
             return active[0]
     except Exception:
@@ -348,18 +393,23 @@ async def run_signal(market: dict, bankroll: float) -> dict:
 async def get_live_bankroll() -> Optional[float]:
     try:
         data = await _kget("/portfolio/balance")
-        bal  = data.get("balance", {})
-        return (bal.get("available_balance_cents", 0) + bal.get("portfolio_value_cents", 0)) / 100
+        # v2: top-level balance + portfolio_value in cents
+        if isinstance(data.get("balance"), (int, float)):
+            return (data.get("balance", 0) + data.get("portfolio_value", 0)) / 100
+        # legacy nested format
+        bal = data.get("balance", {})
+        if isinstance(bal, dict):
+            return (bal.get("available_balance_cents", 0) + bal.get("portfolio_value_cents", 0)) / 100
     except Exception as e:
         log.warning(f"Could not fetch live balance: {e}")
-        return None
+    return None
 
 
 async def check_settlement(ticker: str) -> Optional[str]:
     """Returns 'YES', 'NO', or None if not settled yet."""
     try:
-        data = await _kget(f"/markets/{ticker}")
-        m = data.get("market", data)
+        data = await _kget(f"/markets/{quote(ticker, safe='')}")
+        m = _norm_market(data.get("market", data))
         result = m.get("result")
         if result in ("yes", "no"):
             return result.upper()
@@ -520,15 +570,19 @@ async def main_loop(dry_run: bool, bankroll: float):
             log.info(f"[DRY RUN] Order simulated — no real order sent")
         else:
             try:
+                leg          = rec.lower()
+                v2_side, price = _v2_book(leg, "buy", limit_price)
                 body = {
-                    "ticker": ticker, "action": "buy", "side": rec.lower(),
-                    "type": "limit", "count": contracts,
-                    "yes_price": limit_price if rec == "YES" else (100 - limit_price),
-                    "no_price":  limit_price if rec == "NO"  else (100 - limit_price),
+                    "ticker":                     ticker,
+                    "client_order_id":            str(uuid.uuid4()),
+                    "side":                       v2_side,
+                    "count":                      f"{contracts:.2f}",
+                    "price":                      price,
+                    "time_in_force":              "good_till_canceled",
+                    "self_trade_prevention_type": "taker_at_cross",
                 }
-                result   = await _kpost("/portfolio/orders", {"order": body})
-                order    = result.get("order", result)
-                order_id = order.get("order_id") or order.get("id") or "unknown"
+                result   = await _kpost("/portfolio/events/orders", body)
+                order_id = result.get("order_id") or "unknown"
                 log.info(f"ORDER PLACED — id={order_id}")
             except httpx.HTTPStatusError as e:
                 log.error(f"Kalshi API error {e.response.status_code}: {e.response.text}")

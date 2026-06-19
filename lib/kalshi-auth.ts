@@ -7,13 +7,22 @@
  *   KALSHI-ACCESS-TIMESTAMP — Unix ms timestamp (as string)
  *   KALSHI-ACCESS-SIGNATURE — Base64 RSA-PSS signature
  *
- * Signature payload: `${timestamp}${method}${path}` (direct concat, no separators)
+ * Signature payload: `${timestamp}${method}${signPath}` (direct concat, no separators)
+ * signPath: full `/trade-api/v2/...` path, query string stripped per Kalshi v2 spec.
  */
 
 import { readFileSync } from 'fs'
 import { createSign, constants } from 'crypto'
 import { join } from 'path'
 import { readStoredCreds } from './kalshi-credentials'
+
+/** Path used for RSA signing — always `/trade-api/v2/...`, never includes `?query`. */
+export function kalshiSignPath(path: string): string {
+  const p = path.startsWith('/trade-api/v2')
+    ? path
+    : `/trade-api/v2${path.startsWith('/') ? path : `/${path}`}`
+  return p.split('?')[0]
+}
 
 function loadCreds(): { apiKey: string; privateKey: string } | null {
   // 1. UI-uploaded credentials (stored in .kalshi-credentials.json)
@@ -48,8 +57,8 @@ export function buildKalshiHeaders(method: string, path: string): Record<string,
   const { apiKey, privateKey } = creds
 
   const timestamp = String(Date.now())
-  // Kalshi signing: direct concatenation, no separators
-  const payload = `${timestamp}${method.toUpperCase()}${path}`
+  const signPath  = kalshiSignPath(path)
+  const payload   = `${timestamp}${method.toUpperCase()}${signPath}`
 
   try {
     const sign = createSign('RSA-SHA256')
