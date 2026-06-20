@@ -355,18 +355,52 @@ export default function MarketCard({ market, orderbook, strikePrice, currentBTCP
       const d   = await fetch('/api/positions', { cache: 'no-store' }).then(r => r.json())
       const pos = (d.positions ?? []).find((p: { ticker: string; position: number }) => p.ticker === market.ticker)
       const closeSide = pos && pos.position > 0 ? 'yes' : pos && pos.position < 0 ? 'no' : null
-      if (closeSide && Math.abs(pos.position) > 0) {
-        await fetch('/api/sell-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticker: market.ticker, side: closeSide, count: Math.abs(pos.position) }) })
+      const preSellCount = pos ? Math.abs(pos.position) : 0
+      // Attempt to sell the existing position (if any) and use the sell response's fill_count
+      let filledCount = 0
+      if (closeSide && preSellCount > 0) {
+        try {
+          const sellRes = await fetch('/api/sell-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticker: market.ticker, side: closeSide, count: preSellCount }) })
+          const sellData = await sellRes.json().catch(() => ({}))
+          if (sellRes.ok && sellData.ok && sellData.order && typeof sellData.order.fill_count === 'number') {
+            filledCount = sellData.order.fill_count
+          } else if (sellData.order && sellData.order.fill_count != null) {
+            filledCount = Number(sellData.order.fill_count) || 0
+          } else {
+            // Fallback to pre-sell estimate if sell response missing fill_count
+            filledCount = preSellCount
+          }
+        } catch (err) {
+          // On network/error, fallback to pre-sell estimate
+          filledCount = preSellCount
+        }
       }
-      const newSide  = side
+
+      // Flip to the opposite side of the currently-selected tab
+      const newSide  = side === 'yes' ? 'no' : 'yes'
       const ask      = newSide === 'yes' ? market.yes_ask : market.no_ask
-      const balData  = await fetch('/api/balance', { cache: 'no-store' }).then(r => r.json())
-      const maxAfford = ask > 0 ? Math.floor((balData.balance ?? 0) / ask) : 0
-      const count     = Math.min(500, Math.max(1, maxAfford))
+      // If we closed an existing position, buy the same number of contracts to replace it (use filledCount).
+      // Otherwise fall back to buying as much as available balance allows (capped at 500).
+      let count: number
+      if (filledCount > 0) {
+        count = Math.min(500, Math.max(1, filledCount))
+      } else {
+        const balData  = await fetch('/api/balance', { cache: 'no-store' }).then(r => r.json())
+        const maxAfford = ask > 0 ? Math.floor((balData.balance ?? 0) / ask) : 0
+        count = Math.min(500, Math.max(1, maxAfford))
+      }
       if (count > 0) {
+        const prevSide = side
+        // Optimistic UI: switch tab immediately for speed, revert on failure
+        setSide(newSide)
         const res  = await fetch('/api/place-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticker: market.ticker, side: newSide, count, ...(newSide === 'yes' ? { yesPrice: ask } : { noPrice: ask }), clientOrderId: `flip-${newSide}-${Date.now()}` }) })
         const data = await res.json()
-        setHotkeyFlash(data.ok ? `Flipped → ${newSide.toUpperCase()} ${count}` : `Flip error: ${data.error ?? 'unknown'}`)
+        if (!res.ok || !data.ok) {
+          setHotkeyFlash(`Flip error: ${data.error ?? 'unknown'}`)
+          setSide(prevSide)
+        } else {
+          setHotkeyFlash(`Flipped → ${newSide.toUpperCase()} ${count}`)
+        }
       } else {
         setHotkeyFlash(closeSide ? 'Closed position — no balance to flip' : 'Insufficient balance')
       }
