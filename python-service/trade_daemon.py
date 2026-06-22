@@ -494,9 +494,9 @@ async def main_loop(dry_run: bool, bankroll: float):
             await asyncio.sleep(skip_s)
             continue
 
-        # Already traded this window
+        # Already traded this window — sleep briefly and loop back
         if window_id in session.traded:
-            await asyncio.sleep(min(30, mins_left * 60 * 0.5))
+            await asyncio.sleep(5)
             continue
 
         # ── Active window: fetch market + signal ──────────────────────────────
@@ -547,11 +547,14 @@ async def main_loop(dry_run: bool, bankroll: float):
                 "timing" in r or "min outside" in r for r in reasons
             )
             if timing_only and mins_left > 3.5:
+                log.info(f"Timing-only block — retrying in 30s...")
                 await asyncio.sleep(30)
-                # Don't mark as traded — allow retry
             else:
+                # Mark as traded and wait for window to naturally close
                 session.traded.add(window_id)
-                await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+                wait_s = max(5, (mins_left + 0.75) * 60)
+                log.info(f"Marked window as traded — waiting {fmt(wait_s)} for close...")
+                await asyncio.sleep(wait_s)
             continue
 
         # ── TRADE ───────────────────────────────────────────────────────────[...]
