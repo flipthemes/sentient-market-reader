@@ -30,7 +30,7 @@ from run_backtest import (
     MAKER_FEE_RATE, EMPIRICAL_PRICE_BY_D, BLOCKED_UTC_HOURS,
 )
 
-# ── Env / config ───────────────────────────────────────────────────────────────
+# ── Env / config ────────────────────────────────────────────────────────────[...]
 _env_path = Path(__file__).parent.parent / ".env.local"
 if _env_path.exists():
     for line in _env_path.read_text().splitlines():
@@ -47,7 +47,7 @@ MAX_DAILY_LOSS   = 50.0   # $ hard stop for the day
 MAX_GIVEBACK_X   = 1.5    # stop if peak P&L drops by this × MAX_DAILY_LOSS
 MAX_DAILY_TRADES = 48
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────────────────[...]
 _log_dir = Path(__file__).parent / "logs"
 _log_dir.mkdir(exist_ok=True)
 
@@ -142,7 +142,7 @@ def _v2_book(leg: str, action: str, price_cents: int) -> tuple[str, str]:
     side = "ask" if action == "buy" else "bid"
     return side, f"{comp:.4f}"
 
-# ── Timing helpers ─────────────────────────────────────────────────────────────
+# ── Timing helpers ────────────────────────────────────────────────────────────[...]
 def _et_offset() -> int:
     now = datetime.now(timezone.utc)
     yr  = now.year
@@ -169,7 +169,7 @@ def fmt(secs: float) -> str:
     m, s = divmod(int(abs(secs)), 60)
     return f"{m}m{s:02d}s"
 
-# ── Session state ──────────────────────────────────────────────────────────────
+# ── Session state ───────────────────────────────────────────────────────────[...]
 class Session:
     def __init__(self, bankroll: float):
         self.bankroll      = bankroll
@@ -207,7 +207,7 @@ class Session:
         if self.daily_pnl > self.peak_pnl:
             self.peak_pnl = self.daily_pnl
 
-# ── Market + signal ────────────────────────────────────────────────────────────
+# ── Market + signal ───────────────────────────────────────────────────────────[...]
 async def fetch_market() -> Optional[dict]:
     months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
     off = _et_offset()
@@ -418,7 +418,7 @@ async def check_settlement(ticker: str) -> Optional[str]:
     return None
 
 
-# ── Main loop ──────────────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────[...]
 async def main_loop(dry_run: bool, bankroll: float):
     session = Session(bankroll)
     log.info("=" * 65)
@@ -548,12 +548,13 @@ async def main_loop(dry_run: bool, bankroll: float):
             )
             if timing_only and mins_left > 3.5:
                 await asyncio.sleep(30)
+                # Don't mark as traded — allow retry
             else:
                 session.traded.add(window_id)
                 await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
             continue
 
-        # ── TRADE ─────────────────────────────────────────────────────────────
+        # ── TRADE ───────────────────────────────────────────────────────────[...]
         p_d      = limit_price / 100
         fee_c    = MAKER_FEE_RATE * p_d * (1 - p_d)
         cost_per = p_d + fee_c
@@ -615,7 +616,7 @@ async def main_loop(dry_run: bool, bankroll: float):
         await asyncio.sleep(wait_s)
 
 
-# ── Entry ──────────────────────────────────────────────────────────────────────
+# ── Entry ───────────────────────────────────────────────────────────────[...]
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sentient autonomous trading daemon")
     parser.add_argument("--dry-run",   action="store_true", help="Simulate trades, no real orders")
