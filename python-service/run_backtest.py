@@ -44,7 +44,7 @@ D_THRESHOLD          = 0.0
 D_MAX_THRESHOLD      = 99.0
 
 # Timing
-MIN_MINUTES_LEFT     = 6
+MIN_MINUTES_LEFT     = 3
 MAX_MINUTES_LEFT     = 9
 
 # Hurst
@@ -58,7 +58,7 @@ MARKOV_MIN_GAP       = 0.11
 MIN_PERSIST          = 0.82
 
 # Vol regime
-MAX_VOL_MULT         = 1.25
+MAX_VOL_MULT         = 1.35
 
 # Confidence-tiered flat risk (replaces Kelly)
 # risk_pct = min(20%, KELLY_FRACTION × kelly_full)

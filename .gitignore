@@ -78,3 +78,7 @@ sentient-trader-mcp/*.egg-info/
 # Dev/scratch scripts
 python-service/backtest_67c.py
 python-service/test_tiered_kelly.py
+.vs/slnx.sqlite
+.vs/
+.vs
+

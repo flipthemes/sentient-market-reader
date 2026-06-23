@@ -51,6 +51,27 @@ export default function Home() {
     } catch { /* ignore */ }
   }, [])
 
+  // Auto-refresh interval (seconds). null = off
+  const [autoIntervalSec, setAutoIntervalSec] = useState<number | null>(null)
+  const autoIntervalRef = useRef<number | null>(null)
+
+  // Load auto-refresh preference (stored as '5', '15', '30' or 'off')
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem('sentient-auto-refresh')
+      if (!v || v === 'off') { setAutoIntervalSec(null) }
+      else {
+        const n = parseInt(v, 10)
+        // sanitize: only accept our allowed options (5,15,30). Fallback to 5s if value is invalid but numeric.
+        const ALLOWED = [5, 15, 30]
+        if (!Number.isNaN(n)) {
+          if (ALLOWED.includes(n)) setAutoIntervalSec(n)
+          else setAutoIntervalSec(5)
+        }
+      }
+    } catch { }
+  }, [])
+
   function updateStrategyParam(key: keyof typeof STRATEGY_DEFAULTS, value: number) {
     const next = { ...strategyParams, [key]: value }
     setStrategyParams(next)
@@ -207,6 +228,75 @@ export default function Home() {
     return () => window.removeEventListener('keydown', onKey)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isRunning, serverLocked, secondsUntilExpiry])
+
+  // Auto-refresh interval management
+  // Keep refs for status+runCycle so the scheduler can read latest values without
+  // being re-created every time isRunning/serverLocked changes.
+  const runCycleRefLocal = useRef<typeof runCycle | null>(null)
+  const isRunningRefLocal = useRef<boolean>(isRunning)
+  const serverLockedRefLocal = useRef<boolean>(serverLocked)
+  const secondsUntilExpiryRefLocal = useRef<number>(secondsUntilExpiry)
+  useEffect(() => { runCycleRefLocal.current = runCycle }, [runCycle])
+  useEffect(() => { isRunningRefLocal.current = isRunning }, [isRunning])
+  useEffect(() => { serverLockedRefLocal.current = serverLocked }, [serverLocked])
+  useEffect(() => { secondsUntilExpiryRefLocal.current = secondsUntilExpiry }, [secondsUntilExpiry])
+
+  useEffect(() => {
+    // cleanup helper
+    function clearAutoInterval() {
+      if (autoIntervalRef.current) {
+        window.clearTimeout(autoIntervalRef.current)
+        autoIntervalRef.current = null
+      }
+    }
+
+    // Stop existing interval first
+    clearAutoInterval()
+
+    if (autoIntervalSec == null) return
+
+    // persist preference
+    try { localStorage.setItem('sentient-auto-refresh', String(autoIntervalSec)) } catch { }
+
+    // run immediately, then schedule via recursive timeout (more predictable)
+    const tryRun = async () => {
+      if (!isRunning && !serverLocked && !(secondsUntilExpiry > 0 && secondsUntilExpiry < 120)) {
+        try { await runCycle() } catch { /* ignore */ }
+      }
+    }
+    // schedule helper using setTimeout so we always respect the chosen interval
+    const intervalMs = Math.max(1, autoIntervalSec) * 1000
+    let cancelled = false
+    const scheduleNext = async () => {
+      if (cancelled) return
+      // wait interval, then attempt run
+      autoIntervalRef.current = window.setTimeout(async () => {
+        if (cancelled) return
+        if (!isRunning && !serverLocked && !(secondsUntilExpiry > 0 && secondsUntilExpiry < 120)) {
+          try { await runCycle() } catch { /* ignore */ }
+        }
+        scheduleNext()
+      }, intervalMs)
+    }
+
+    // persist preference
+    try { localStorage.setItem('sentient-auto-refresh', String(autoIntervalSec)) } catch { }
+
+    // initial immediate run only when enabling/changing the interval.
+    // The scheduler uses refs to read live state so we avoid re-creating it on every status change.
+    (async () => {
+      if (runCycleRefLocal.current && !isRunningRefLocal.current && !serverLockedRefLocal.current && !(secondsUntilExpiryRefLocal.current > 0 && secondsUntilExpiryRefLocal.current < 120)) {
+        try { await runCycleRefLocal.current() } catch { /* ignore */ }
+      }
+      scheduleNext()
+    })()
+
+    return () => {
+      cancelled = true
+      clearAutoInterval()
+    }
+  // Only restart scheduler when the chosen interval changes
+  }, [autoIntervalSec])
 
   function handleStartBot() {
     setShowBotWarning(true)
@@ -572,6 +662,27 @@ export default function Home() {
 
                 {/* Run / Stop + expiry — pushed right */}
                 <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {/* Auto-refresh interval selector: cycles 5m -> 15m -> 30m -> Off */}
+                  <button
+                    onClick={() => {
+                      const OPTIONS = [5, 15, 30, null] as const
+                      const idx = OPTIONS.findIndex(o => (o === null ? autoIntervalSec === null : o === autoIntervalSec))
+                      const next = OPTIONS[(idx + 1) % OPTIONS.length]
+                      setAutoIntervalSec(next === null ? null : next)
+                      try { localStorage.setItem('sentient-auto-refresh', next === null ? 'off' : String(next)) } catch {}
+                    }}
+                    title="Cycle auto-refresh interval: 5s → 15s → 30s → Off"
+                    style={{
+                      padding: '6px 10px', borderRadius: 8, cursor: 'pointer', flexShrink: 0,
+                      border: autoIntervalSec != null ? '1px solid var(--blue)' : '1px solid var(--border)',
+                      background: autoIntervalSec != null ? 'var(--blue-pale)' : 'var(--bg-secondary)',
+                      color: autoIntervalSec != null ? 'var(--blue)' : 'var(--text-muted)',
+                      fontSize: 11, fontWeight: 700,
+                      transition: 'all 0.15s',
+                    }}
+                  >
+                    {autoIntervalSec ? `Auto: ${autoIntervalSec}s` : 'Auto: Off'}
+                  </button>
                   <button
                     onClick={isRunning ? stopCycle : (serverLocked ? undefined : () => {
                       if (secondsUntilExpiry > 0 && secondsUntilExpiry < 120) {
