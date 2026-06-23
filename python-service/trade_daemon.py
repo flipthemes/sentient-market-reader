@@ -30,7 +30,7 @@ from run_backtest import (
     MAKER_FEE_RATE, EMPIRICAL_PRICE_BY_D, BLOCKED_UTC_HOURS,
 )
 
-# ── Env / config ───────────────────────────────────────────────────────────────
+# ── Env / config ────────────────────────────────────────────────────────────[...]
 _env_path = Path(__file__).parent.parent / ".env.local"
 if _env_path.exists():
     for line in _env_path.read_text().splitlines():
@@ -47,7 +47,7 @@ MAX_DAILY_LOSS   = 50.0   # $ hard stop for the day
 MAX_GIVEBACK_X   = 1.5    # stop if peak P&L drops by this × MAX_DAILY_LOSS
 MAX_DAILY_TRADES = 48
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────────────────[...]
 _log_dir = Path(__file__).parent / "logs"
 _log_dir.mkdir(exist_ok=True)
 
@@ -120,28 +120,6 @@ async def _kpost(endpoint: str, body: dict) -> dict:
         r.raise_for_status()
         return r.json()
 
-def _norm_market(m: dict) -> dict:
-    """v2 API returns yes_ask_dollars (USD string) — normalize to integer cents."""
-    for field, dollar_field in [
-        ("yes_ask", "yes_ask_dollars"), ("yes_bid", "yes_bid_dollars"),
-        ("no_ask",  "no_ask_dollars"),  ("no_bid",  "no_bid_dollars"),
-    ]:
-        if not m.get(field) and m.get(dollar_field) is not None:
-            try:
-                m[field] = round(float(m[dollar_field]) * 100)
-            except (ValueError, TypeError):
-                pass
-    return m
-
-def _v2_book(leg: str, action: str, price_cents: int) -> tuple[str, str]:
-    """Map yes/no leg + buy/sell + cents → V2 bid/ask + dollar price on YES book."""
-    if leg == "yes":
-        side = "bid" if action == "buy" else "ask"
-        return side, f"{price_cents / 100:.4f}"
-    comp = (100 - price_cents) / 100
-    side = "ask" if action == "buy" else "bid"
-    return side, f"{comp:.4f}"
-
 # ── Timing helpers ─────────────────────────────────────────────────────────────
 def _et_offset() -> int:
     now = datetime.now(timezone.utc)
@@ -169,7 +147,7 @@ def fmt(secs: float) -> str:
     m, s = divmod(int(abs(secs)), 60)
     return f"{m}m{s:02d}s"
 
-# ── Session state ──────────────────────────────────────────────────────────────
+# ── Session state ───────────────────────────────────────────────────────────[...]
 class Session:
     def __init__(self, bankroll: float):
         self.bankroll      = bankroll
@@ -207,7 +185,7 @@ class Session:
         if self.daily_pnl > self.peak_pnl:
             self.peak_pnl = self.daily_pnl
 
-# ── Market + signal ────────────────────────────────────────────────────────────
+# ── Market + signal ───────────────────────────────────────────────────────────[...]
 async def fetch_market() -> Optional[dict]:
     months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
     off = _et_offset()
@@ -418,7 +396,7 @@ async def check_settlement(ticker: str) -> Optional[str]:
     return None
 
 
-# ── Main loop ──────────────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────[...]
 async def main_loop(dry_run: bool, bankroll: float):
     session = Session(bankroll)
     log.info("=" * 65)
@@ -494,9 +472,9 @@ async def main_loop(dry_run: bool, bankroll: float):
             await asyncio.sleep(skip_s)
             continue
 
-        # Already traded this window
+        # Already traded this window — sleep briefly and loop back
         if window_id in session.traded:
-            await asyncio.sleep(min(30, mins_left * 60 * 0.5))
+            await asyncio.sleep(5)
             continue
 
         # ── Active window: fetch market + signal ──────────────────────────────
@@ -547,13 +525,17 @@ async def main_loop(dry_run: bool, bankroll: float):
                 "timing" in r or "min outside" in r for r in reasons
             )
             if timing_only and mins_left > 3.5:
+                log.info(f"Timing-only block — retrying in 30s...")
                 await asyncio.sleep(30)
             else:
+                # Mark as traded and wait for window to naturally close
                 session.traded.add(window_id)
-                await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+                wait_s = max(5, (mins_left + 0.75) * 60)
+                log.info(f"Marked window as traded — waiting {fmt(wait_s)} for close...")
+                await asyncio.sleep(wait_s)
             continue
 
-        # ── TRADE ─────────────────────────────────────────────────────────────
+        # ── TRADE ───────────────────────────────────────────────────────────[...]
         p_d      = limit_price / 100
         fee_c    = MAKER_FEE_RATE * p_d * (1 - p_d)
         cost_per = p_d + fee_c
@@ -615,7 +597,7 @@ async def main_loop(dry_run: bool, bankroll: float):
         await asyncio.sleep(wait_s)
 
 
-# ── Entry ──────────────────────────────────────────────────────────────────────
+# ── Entry ───────────────────────────────────────────────────────────────[...]
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sentient autonomous trading daemon")
     parser.add_argument("--dry-run",   action="store_true", help="Simulate trades, no real orders")

@@ -355,85 +355,18 @@ export default function MarketCard({ market, orderbook, strikePrice, currentBTCP
       const d   = await fetch('/api/positions', { cache: 'no-store' }).then(r => r.json())
       const pos = (d.positions ?? []).find((p: { ticker: string; position: number }) => p.ticker === market.ticker)
       const closeSide = pos && pos.position > 0 ? 'yes' : pos && pos.position < 0 ? 'no' : null
-      const preSellCount = pos ? Math.abs(pos.position) : 0
-      // Attempt to sell the existing position (if any) and use the sell response's fill_count
-      let filledCount = 0
-      if (closeSide && preSellCount > 0) {
-        try {
-          const sellRes = await fetch('/api/sell-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticker: market.ticker, side: closeSide, count: preSellCount }) })
-          const sellData = await sellRes.json().catch(() => ({}))
-          if (sellRes.ok && sellData.ok && sellData.order && typeof sellData.order.fill_count === 'number') {
-            filledCount = sellData.order.fill_count
-          } else if (sellData.order && sellData.order.fill_count != null) {
-            filledCount = Number(sellData.order.fill_count) || 0
-          } else {
-            // If the sell response did not include fill_count, poll positions for confirmation
-            // to determine how many contracts were actually closed.
-            const POLL_MS = 500
-            const MAX_POLLS = 10 // 5s
-            let polls = 0
-            let finalPos = null
-            while (polls < MAX_POLLS) {
-              try {
-                const d = await fetch('/api/positions', { cache: 'no-store' }).then(r => r.json())
-                const pos = (d.positions ?? []).find((p: { ticker: string; position: number }) => p.ticker === market.ticker)
-                finalPos = pos ? pos.position : 0
-                // If the position no longer exists or is zero, assume sell completed
-                if (!pos || pos.position === 0) break
-              } catch {
-                // ignore and retry
-              }
-              polls += 1
-              await new Promise(res => setTimeout(res, POLL_MS))
-            }
-            if (finalPos == null) {
-              filledCount = preSellCount
-            } else {
-              // If we closed a 'no' position, finalPos should be 0 or negative. Compute filled count
-              const remaining = Math.abs(finalPos)
-              filledCount = Math.max(0, preSellCount - remaining)
-              if (filledCount === 0) filledCount = preSellCount
-            }
-          }
-        } catch (err) {
-          // On network/error, fallback to pre-sell estimate
-          filledCount = preSellCount
-        }
+      if (closeSide && Math.abs(pos.position) > 0) {
+        await fetch('/api/sell-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticker: market.ticker, side: closeSide, count: Math.abs(pos.position) }) })
       }
-
-      // Flip to the opposite side. If we detected an existing position (closeSide),
-      // base the new side on that actual position rather than the UI-selected tab
-      // to avoid mismatches where the tab and real position disagree.
-      const newSide = closeSide ? (closeSide === 'yes' ? 'no' : 'yes') : (side === 'yes' ? 'no' : 'yes')
+      const newSide  = side
       const ask      = newSide === 'yes' ? market.yes_ask : market.no_ask
-      // If we closed an existing position, buy the same number of contracts to replace it (use filledCount).
-      // Otherwise fall back to buying as much as available balance allows (capped at 500).
-      let count: number
-      if (filledCount > 0) {
-        // Buy 1.5× the number of filled contracts by default so flips restore
-        // exposure on the opposite side while being gentler on bankrolls.
-        // Use Math.floor to avoid overshooting.
-        count = Math.min(500, Math.max(1, Math.floor(filledCount * 1.5)))
-      } else {
-        const balData  = await fetch('/api/balance', { cache: 'no-store' }).then(r => r.json())
-        const maxAfford = ask > 0 ? Math.floor((balData.balance ?? 0) / ask) : 0
-        count = Math.min(500, Math.max(1, maxAfford))
-      }
-        if (count > 0) {
-        const prevSide = side
-        // Do not optimistically change the UI tab before the order completes.
-        // Wait for the place-order response and only update UI on success to avoid
-        // racing other UI actions that rely on `side`.
+      const balData  = await fetch('/api/balance', { cache: 'no-store' }).then(r => r.json())
+      const maxAfford = ask > 0 ? Math.floor((balData.balance ?? 0) / ask) : 0
+      const count     = Math.min(500, Math.max(1, maxAfford))
+      if (count > 0) {
         const res  = await fetch('/api/place-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticker: market.ticker, side: newSide, count, ...(newSide === 'yes' ? { yesPrice: ask } : { noPrice: ask }), clientOrderId: `flip-${newSide}-${Date.now()}` }) })
         const data = await res.json()
-        if (!res.ok || !data.ok) {
-          setHotkeyFlash(`Flip error: ${data.error ?? 'unknown'}`)
-          // keep prevSide (no optimistic change was made)
-        } else {
-          // Only update UI after successful placement
-          setSide(newSide)
-          setHotkeyFlash(`Flipped → ${newSide.toUpperCase()} ${count}`)
-        }
+        setHotkeyFlash(data.ok ? `Flipped → ${newSide.toUpperCase()} ${count}` : `Flip error: ${data.error ?? 'unknown'}`)
       } else {
         setHotkeyFlash(closeSide ? 'Closed position — no balance to flip' : 'Insufficient balance')
       }

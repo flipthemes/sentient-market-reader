@@ -4,13 +4,13 @@
 ───────────────────────────────────────────────────────────────────────── */
 
 .root {
-  --bg:         #060608;
-  --border:     #1e1e26;
-  --border-dim: #141418;
-  --text:       #e2e2e8;
-  --text-mid:   #7878a0;
-  --text-muted: #3e3e52;
-  --accent:     #7b9bb8;
+  --bg:         #191724;
+  --border:     #1f1d2e;
+  --border-dim: #26233a;
+  --text:       #e0def4;
+  --text-mid:   #908caa;
+  --text-muted: #6e6a86;
+  --accent:     #eb6f92;
   --green:      #50a878;
   --pink:       #c06070;
 
