@@ -33,7 +33,7 @@ from run_backtest import (
 # ── Env / config ────────────────────────────────────────────────────────────[...]
 _env_path = Path(__file__).parent.parent / ".env.local"
 if _env_path.exists():
-    for line in _env_path.read_text().splitlines():
+    for line in _env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         if line and not line.startswith("#") and "=" in line:
             k, _, v = line.partition("=")
             os.environ.setdefault(k.strip(), v.strip())
@@ -43,9 +43,11 @@ API_PREFIX     = "/trade-api/v2"
 KALSHI_API_KEY = os.environ.get("KALSHI_API_KEY", "")
 KALSHI_PEM     = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private.pem")
 
-MAX_DAILY_LOSS   = 50.0   # $ hard stop for the day
-MAX_GIVEBACK_X   = 1.5    # stop if peak P&L drops by this × MAX_DAILY_LOSS
-MAX_DAILY_TRADES = 48
+MAX_DAILY_LOSS      = 50.0   # $ hard stop for the day
+MAX_GIVEBACK_X      = 1.5    # stop if peak P&L drops by this × MAX_DAILY_LOSS
+MAX_DAILY_TRADES    = 48
+DAEMON_MAX_TRADE_PCT = 0.35
+DAEMON_MAX_CONTRACTS = 50
 
 # ── Logging ─────────────────────────────────────────────────────────────[...]
 _log_dir = Path(__file__).parent / "logs"
@@ -120,6 +122,30 @@ async def _kpost(endpoint: str, body: dict) -> dict:
         r.raise_for_status()
         return r.json()
 
+
+def _norm_market(m: dict) -> dict:
+    """Normalize v2 market fields that may come back as dollar strings."""
+    for field, dollar_field in [
+        ("yes_ask", "yes_ask_dollars"), ("yes_bid", "yes_bid_dollars"),
+        ("no_ask",  "no_ask_dollars"),  ("no_bid",  "no_bid_dollars"),
+    ]:
+        if not m.get(field) and m.get(dollar_field) is not None:
+            try:
+                m[field] = round(float(m[dollar_field]) * 100)
+            except (ValueError, TypeError):
+                pass
+    return m
+
+
+def _v2_book(leg: str, action: str, price_cents: int) -> tuple[str, str]:
+    """Map yes/no leg + buy/sell + cents → V2 bid/ask + dollar price on the YES book."""
+    if leg == "yes":
+        side = "bid" if action == "buy" else "ask"
+        return side, f"{price_cents / 100:.4f}"
+    comp = (100 - price_cents) / 100
+    side = "ask" if action == "buy" else "bid"
+    return side, f"{comp:.4f}"
+
 # ── Timing helpers ─────────────────────────────────────────────────────────────
 def _et_offset() -> int:
     now = datetime.now(timezone.utc)
@@ -146,6 +172,20 @@ def next_window_close() -> datetime:
 def fmt(secs: float) -> str:
     m, s = divmod(int(abs(secs)), 60)
     return f"{m}m{s:02d}s"
+
+
+def should_retry_window(mins_left: float, reasons: list[str]) -> bool:
+    """Continue reevaluating the window while it is still in the active entry period."""
+    return mins_left > 3.5
+
+
+def retry_delay_for_window(mins_left: float) -> float:
+    """Poll more aggressively inside the active 6–9 minute entry window."""
+    if mins_left <= 6.0:
+        return 3.0
+    if mins_left <= 9.0:
+        return 4.0
+    return 5.0
 
 # ── Session state ───────────────────────────────────────────────────────────[...]
 class Session:
@@ -331,8 +371,8 @@ async def run_signal(market: dict, bankroll: float) -> dict:
     elif 73 < limit_price <= 85:  frac = 0.08
     else:                         frac = 0.05
 
-    risk_pct  = min(MAX_TRADE_PCT, frac * kelly_full)
-    dyn_cap   = max(25, round(bankroll / 200 * 25))
+    risk_pct  = min(DAEMON_MAX_TRADE_PCT, frac * kelly_full)
+    dyn_cap   = DAEMON_MAX_CONTRACTS
     contracts = min(max(1, round(bankroll * risk_pct / cost_c)), dyn_cap) if rec != "NO_TRADE" else 0
     max_loss  = round(cost_c * contracts, 2)
     ev        = round(contracts * (net_win * p_win - cost_c * (1 - p_win)), 2)
@@ -365,6 +405,83 @@ async def run_signal(market: dict, bankroll: float) -> dict:
             "yes_ask":   yes_ask,
             "no_ask":    no_ask,
         },
+    }
+
+
+def _normalize_order_status(payload: dict) -> tuple[str, int, int]:
+    """Normalize Kalshi order payloads into a simple status/fill summary."""
+    data = payload or {}
+    if isinstance(data.get("order"), dict):
+        data = data["order"]
+    elif isinstance(data.get("orders"), list) and data["orders"]:
+        data = data["orders"][0]
+
+    raw_status = str(data.get("status") or data.get("order_status") or "").strip().lower()
+    if raw_status in {"filled", "complete", "completed"}:
+        status = "filled"
+    elif raw_status in {"partially_filled", "partial", "partially-filled", "partially filled"}:
+        status = "partially_filled"
+    elif raw_status in {"canceled", "cancelled", "expired", "rejected"}:
+        status = "canceled"
+    elif raw_status in {"resting", "open", "pending", "new", "accepted", "submitted", "queued"}:
+        status = "resting"
+    else:
+        status = raw_status or "unknown"
+
+    def _to_int(value) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    filled_count = _to_int(data.get("filled_count") if data.get("filled_count") is not None else data.get("filled_quantity"))
+    remaining_count = _to_int(data.get("remaining_count") if data.get("remaining_count") is not None else data.get("remaining_quantity"))
+    if status == "filled" and remaining_count <= 0:
+        remaining_count = 0
+    return status, filled_count, remaining_count
+
+
+async def verify_order_status(order_id: str) -> dict:
+    """Query Kalshi for the latest status of a placed order and normalize it."""
+    try:
+        payload = await _kget(f"/portfolio/orders/{quote(order_id, safe='')}")
+    except Exception as exc:
+        try:
+            payload = await _kget("/portfolio/orders", {"limit": 20})
+            if isinstance(payload, dict) and isinstance(payload.get("orders"), list):
+                for item in payload["orders"]:
+                    if str(item.get("order_id") or item.get("id") or "") == str(order_id):
+                        payload = item
+                        break
+                else:
+                    payload = {}
+            else:
+                payload = {}
+        except Exception as fallback_exc:
+            return {
+                "order_id": order_id,
+                "status": "unknown",
+                "filled_count": 0,
+                "remaining_count": 0,
+                "raw": {},
+                "error": f"{exc}; {fallback_exc}",
+            }
+
+    if isinstance(payload, dict) and isinstance(payload.get("orders"), list):
+        for item in payload["orders"]:
+            if str(item.get("order_id") or item.get("id") or "") == str(order_id):
+                payload = item
+                break
+    if isinstance(payload, dict) and isinstance(payload.get("order"), dict):
+        payload = payload["order"]
+
+    status, filled_count, remaining_count = _normalize_order_status(payload)
+    return {
+        "order_id": order_id,
+        "status": status,
+        "filled_count": filled_count,
+        "remaining_count": remaining_count,
+        "raw": payload,
     }
 
 
@@ -520,15 +637,11 @@ async def main_loop(dry_run: bool, bankroll: float):
             reason_str = " | ".join(reasons) if reasons else "no edge"
             log.info(f"NO TRADE — {reason_str}")
 
-            # Re-check in 30s only if timing is the only blocker and window is still open
-            timing_only = reasons and all(
-                "timing" in r or "min outside" in r for r in reasons
-            )
-            if timing_only and mins_left > 3.5:
-                log.info(f"Timing-only block — retrying in 30s...")
-                await asyncio.sleep(30)
+            if should_retry_window(mins_left, reasons):
+                delay_s = retry_delay_for_window(mins_left)
+                log.info(f"No trade — re-evaluating in {delay_s:.0f}s...")
+                await asyncio.sleep(delay_s)
             else:
-                # Mark as traded and wait for window to naturally close
                 session.traded.add(window_id)
                 wait_s = max(5, (mins_left + 0.75) * 60)
                 log.info(f"Marked window as traded — waiting {fmt(wait_s)} for close...")
@@ -560,12 +673,28 @@ async def main_loop(dry_run: bool, bankroll: float):
                     "side":                       v2_side,
                     "count":                      f"{contracts:.2f}",
                     "price":                      price,
-                    "time_in_force":              "good_till_canceled",
+                    "time_in_force":              "immediate_or_cancel",
                     "self_trade_prevention_type": "taker_at_cross",
                 }
                 result   = await _kpost("/portfolio/events/orders", body)
                 order_id = result.get("order_id") or "unknown"
                 log.info(f"ORDER PLACED — id={order_id}")
+
+                # Verify the order status immediately so we only track it if it actually filled.
+                order_status = None
+                for _ in range(3):
+                    order_status = await verify_order_status(order_id)
+                    if order_status["status"] in {"filled", "partially_filled"} and order_status["filled_count"] > 0:
+                        break
+                    await asyncio.sleep(2)
+
+                if order_status:
+                    status = order_status["status"]
+                    filled_count = order_status["filled_count"]
+                    remaining_count = order_status["remaining_count"]
+                    log.info(
+                        f"ORDER STATUS — id={order_id} status={status} filled={filled_count}/{contracts} remaining={remaining_count}"
+                    )
             except httpx.HTTPStatusError as e:
                 log.error(f"Kalshi API error {e.response.status_code}: {e.response.text}")
                 session.traded.add(window_id)
@@ -579,17 +708,21 @@ async def main_loop(dry_run: bool, bankroll: float):
 
         session.traded.add(window_id)
 
-        # Queue for settlement check
-        if not dry_run:
+        # Queue for settlement check only when the order actually filled.
+        if not dry_run and order_status and order_status["status"] in {"filled", "partially_filled"} and order_status["filled_count"] > 0:
+            filled_contracts = max(1, int(order_status["filled_count"]))
             session.pending[window_id] = {
                 "ticker":      ticker,
                 "side":        rec,
-                "contracts":   contracts,
+                "contracts":   filled_contracts,
                 "limit_price": limit_price,
-                "cost":        round(cost_per * contracts, 2),
-                "net_win":     round(net_win  * contracts, 2),
+                "cost":        round(cost_per * filled_contracts, 2),
+                "net_win":     round(net_win  * filled_contracts, 2),
                 "order_id":    order_id,
+                "order_status": order_status["status"],
             }
+        elif not dry_run:
+            log.warning(f"Order {order_id} was not confirmed as filled — skipping settlement tracking")
 
         # Sleep until window closes + 45s buffer for settlement
         wait_s = max(5, (mins_left + 0.75) * 60)

@@ -38,7 +38,8 @@ import run_backtest as _bt
 PARAM_GRID = [
     ("MARKOV_MIN_GAP",    [0.08, 0.09, 0.10, 0.11, 0.13, 0.15],  "Markov min gap"),
     ("MIN_PERSIST",       [0.78, 0.80, 0.82, 0.85, 0.87],         "Min persist"),
-    ("MAX_ENTRY_PRICE_RM",[68,   70,   71,   72,   73,   74],      "Max entry price (¢)"),
+    ("MAX_ENTRY_PRICE_YES", [68, 70, 71, 72, 73, 74],              "Max YES entry price (¢)"),
+    ("MAX_ENTRY_PRICE_NO",  [58, 60, 62, 65, 68, 70],              "Max NO entry price (¢)"),
     ("MIN_MINUTES_LEFT",  [3,    4,    5,    6,    7],              "Min minutes left"),
     ("MAX_MINUTES_LEFT",  [8,    9,    10,   11,   12],             "Max minutes left"),
     ("MAX_VOL_MULT",      [1.10, 1.15, 1.25, 1.35, 1.50],         "Max vol multiplier"),
@@ -232,7 +233,7 @@ regime), Garman-Klass vol < 1.25×ref, timing window (6-9 min, or 3-12 for golde
 {json.dumps(all_results[:10], indent=2)}
 """
 
-    if best and score(best) > score(baseline):
+    if best and score(best) > score(baseline) and score(baseline) > -9999:
         ctx += f"""
 ## Best improvement found
 {json.dumps(best, indent=2)}
@@ -344,8 +345,10 @@ def main():
     print("Fetching historical data (once)...")
     t0 = time.time()
     markets = _bt.fetch_settled_markets(args.days)
-    c15     = _bt.fetch_candles_15m(args.days + 5)
-    c5      = _bt.fetch_candles_5m(args.days + 5)
+    # Keep a wide candle window for indicator warm-up and stable ablations.
+    candle_days = max(args.days + 5, 60)
+    c15     = _bt.fetch_candles_15m(candle_days)
+    c5      = _bt.fetch_candles_5m(candle_days)
     print(f"  {len(markets)} markets, {len(c15)} 15m candles, {len(c5)} 5m candles "
           f"({time.time()-t0:.0f}s)\n")
 
@@ -389,7 +392,9 @@ def main():
     all_variations.sort(key=score, reverse=True)
     best = all_variations[0] if all_variations else None
 
-    if best and score(best) > b_score:
+    if b_score <= -9999:
+        print("Baseline has <10 executed trades; score-based ranking is not reliable yet.\n")
+    elif best and score(best) > b_score:
         print(f"Best variation: {best['variation_label']} "
               f"(score {score(best):.1f} vs baseline {b_score:.1f}, "
               f"{(score(best)/max(abs(b_score),0.01)-1)*100:+.0f}%)\n")
@@ -480,7 +485,7 @@ def main():
     print(f"Report saved → {report_path}")
 
     # ── Step 7: Propose git branch ────────────────────────────────────────────
-    if not args.no_branch and best and score(best) > b_score:
+    if not args.no_branch and b_score > -9999 and best and score(best) > b_score:
         branch = propose_branch(best, b_score)
         if branch:
             print(f"\nProposed branch created: {branch}")

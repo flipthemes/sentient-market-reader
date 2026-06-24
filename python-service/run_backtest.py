@@ -71,11 +71,13 @@ MIN_ENTRY_PRICE_RM   = 0     # no floor — let any price through
 MAX_ENTRY_PRICE_YES  = 72    # ¢ — YES cap: market underprices our momentum signal at ≤72¢
 MAX_ENTRY_PRICE_NO   = 65    # ¢ — NO cap: above 65¢ NO = consensus trade with bad payout ratio
 MAX_ENTRY_PRICE_RM   = MAX_ENTRY_PRICE_YES  # kept for external imports expecting this name
-MIN_DIST_PCT         = 0.02
+MIN_DIST_PCT         = 0.05
 MAX_CONTRACTS_RM     = 500
 REF_VOL_15M          = 0.002
 MAX_TRADE_PCT        = 0.20
 KELLY_FRACTION       = 0.18
+DAEMON_MAX_TRADE_PCT = 0.35
+DAEMON_MAX_CONTRACTS = 50
 MAX_TRADES_PER_DAY   = 48
 MAX_DAILY_LOSS_PCT   = 25
 MAX_DAILY_LOSS_FLOOR = 0
@@ -276,25 +278,53 @@ def _parse_yahoo(data: dict) -> list:
     return candles
 
 
-def _cache(name: str) -> str:
-    return os.path.join(os.path.dirname(__file__), f'_backtest_cache_{name}.json')
+def _cache(name: str, days_back: int | None = None) -> str:
+    suffix = f"_{days_back}d" if days_back else ""
+    return os.path.join(os.path.dirname(__file__), f"_backtest_cache_{name}{suffix}.json")
+
+
+def _cache_is_sufficient(candles: list, days_back: int, interval_min: int) -> bool:
+    # Yahoo can occasionally return sparse data; reject clearly undersized caches.
+    expected = days_back * 24 * (60 // interval_min)
+    min_expected = max(96, int(expected * 0.6))
+    return len(candles) >= min_expected
 
 
 def fetch_candles_15m(days_back: int = 60) -> list:
-    p = _cache('15m')
+    p = _cache('15m', days_back)
+    p_legacy = _cache('15m')
     if os.path.exists(p) and time.time() - os.path.getmtime(p) < 3600:
-        with open(p) as f: data = json.load(f)
-        log.info(f"Loaded {len(data)} BTC/15m candles (cache)"); return data
+        with open(p) as f:
+            data = json.load(f)
+        if _cache_is_sufficient(data, days_back, 15):
+            log.info(f"Loaded {len(data)} BTC/15m candles (cache)")
+            return data
+    if os.path.exists(p_legacy) and time.time() - os.path.getmtime(p_legacy) < 3600:
+        with open(p_legacy) as f:
+            data = json.load(f)
+        if _cache_is_sufficient(data, days_back, 15):
+            log.info(f"Loaded {len(data)} BTC/15m candles (legacy cache)")
+            return data
     data = _parse_yahoo(_get(f"{YAHOO_BASE}/BTC-USD?interval=15m&range={days_back}d"))
     with open(p, 'w') as f: json.dump(data, f)
     log.info(f"Fetched {len(data)} BTC/15m candles"); return data
 
 
 def fetch_candles_5m(days_back: int = 60) -> list:
-    p = _cache('5m')
+    p = _cache('5m', days_back)
+    p_legacy = _cache('5m')
     if os.path.exists(p) and time.time() - os.path.getmtime(p) < 3600:
-        with open(p) as f: data = json.load(f)
-        log.info(f"Loaded {len(data)} BTC/5m candles (cache)"); return data
+        with open(p) as f:
+            data = json.load(f)
+        if _cache_is_sufficient(data, days_back, 5):
+            log.info(f"Loaded {len(data)} BTC/5m candles (cache)")
+            return data
+    if os.path.exists(p_legacy) and time.time() - os.path.getmtime(p_legacy) < 3600:
+        with open(p_legacy) as f:
+            data = json.load(f)
+        if _cache_is_sufficient(data, days_back, 5):
+            log.info(f"Loaded {len(data)} BTC/5m candles (legacy cache)")
+            return data
     data = _parse_yahoo(_get(f"{YAHOO_BASE}/BTC-USD?interval=5m&range={days_back}d"))
     with open(p, 'w') as f: json.dump(data, f)
     log.info(f"Fetched {len(data)} BTC/5m candles"); return data
@@ -550,18 +580,24 @@ def simulate(records: list) -> float:
 
         p_dollars        = lp / 100.0
         fee_per_c_raw    = MAKER_FEE_RATE * p_dollars * (1 - p_dollars)
-        total_cost_per_c = p_dollars + fee_per_c_raw
+        cost_per_contract = p_dollars + fee_per_c_raw
 
-        # 20% fractional Kelly sizing
         p_win            = r['p_yes'] if r['side'] == 'yes' else (1.0 - r['p_yes'])
         net_win_per_c    = (1.0 - p_dollars) - fee_per_c_raw
-        b_odds           = net_win_per_c / total_cost_per_c if total_cost_per_c > 0 else 1.0
+        b_odds           = net_win_per_c / cost_per_contract if cost_per_contract > 0 else 1.0
         kelly_full       = max(0.0, (b_odds * p_win - (1.0 - p_win)) / b_odds)
-        risk_pct         = min(MAX_TRADE_PCT, KELLY_FRACTION * kelly_full)
-        risk_dollars     = cash * risk_pct
-        budget_contracts = round(risk_dollars / total_cost_per_c) if total_cost_per_c > 0 else 1
-        dynamic_cap      = max(MAX_ORDER_DEPTH, round(cash / STARTING_CASH * MAX_ORDER_DEPTH))
-        contracts        = min(max(1, budget_contracts), MAX_CONTRACTS_RM, dynamic_cap)
+
+        if 65 <= lp <= 73:
+            frac = 0.35
+        elif 73 < lp <= 79:
+            frac = 0.12
+        elif 79 < lp <= 85:
+            frac = 0.08
+        else:
+            frac = 0.05
+
+        risk_pct         = min(DAEMON_MAX_TRADE_PCT, frac * kelly_full)
+        contracts        = min(max(1, round(cash * risk_pct / cost_per_contract)), DAEMON_MAX_CONTRACTS)
 
         avg_cents = (SLIPPAGE_FREE_CTRS * lp + (contracts - SLIPPAGE_FREE_CTRS) *
                      (lp + (contracts - SLIPPAGE_FREE_CTRS) * SLIPPAGE_CENTS_PER / 2)
