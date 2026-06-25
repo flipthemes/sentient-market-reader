@@ -717,6 +717,8 @@ class HourlyServerAgent extends EventEmitter {
       let liveOrderId: string | undefined
       let orderErrorMsg:   string | undefined
       let iocUnfilled      = false
+      let filledContracts  = 0
+      let filledCost       = 0
 
       try {
         const ioPrice  = (p: number) => Math.min(99, p + 3)
@@ -749,9 +751,10 @@ class HourlyServerAgent extends EventEmitter {
 
         if (wasFilled(res)) {
           liveOrderId = res.order!.order_id
-          const filled = res.order!.fill_count ?? contracts
-          console.log(`${LOG_PREFIX} IOC filled ${filled} contracts`)
-          limitSellOrder({ ticker: exec.marketTicker, side: exec.side, count: filled })
+          filledContracts = Math.max(1, res.order!.fill_count ?? contracts)
+          filledCost = filledContracts * costPerContract
+          console.log(`${LOG_PREFIX} IOC filled ${filledContracts} contracts`)
+          limitSellOrder({ ticker: exec.marketTicker, side: exec.side, count: filledContracts })
             .then(sr => { if (!sr.ok) console.warn(`${LOG_PREFIX} limit-sell failed: ${sr.error}`) })
             .catch(e => console.warn(`${LOG_PREFIX} limit-sell error:`, e))
         } else if (!res.ok) {
@@ -772,14 +775,15 @@ class HourlyServerAgent extends EventEmitter {
         sliceNum:        1,
         side:            exec.side,
         limitPrice:      liveLimitPrice,
-        contracts,
-        cost,
+        contracts:       liveOrderId ? filledContracts : 0,
+        cost:            liveOrderId ? filledCost : 0,
         marketTicker:    exec.marketTicker,
         strikePrice:     md.strikePrice,
         btcPriceAtEntry: btcPrice,
         expiresAt:       md.activeMarket.close_time,
         enteredAt:       new Date().toISOString(),
-        status:          'open',
+        status:          liveOrderId ? 'open' : 'lost',
+        pnl:             liveOrderId ? undefined : 0,
         pModel:          prob.pModel,
         pMarket:         prob.pMarket,
         edge:            prob.edge,
@@ -807,8 +811,8 @@ class HourlyServerAgent extends EventEmitter {
         this.windowBetPlaced = true
         this.orderError      = null
         this.agentPhase      = 'bet_placed'
-        if (this.kellyMode) this.bankroll = Math.max(1, this.bankroll - cost)
-        console.log(`${LOG_PREFIX} ✓ Bet placed — ${exec.side.toUpperCase()} ${contracts}× @ ${liveLimitPrice}¢ on ${evTicker}`)
+        if (this.kellyMode) this.bankroll = Math.max(1, this.bankroll - filledCost)
+        console.log(`${LOG_PREFIX} ✓ Bet placed — ${exec.side.toUpperCase()} ${filledContracts}× @ ${liveLimitPrice}¢ on ${evTicker}`)
       } else if (iocUnfilled) {
         this.orderError  = orderErrorMsg ?? 'Skipped — no fill'
         this.agentPhase  = 'pass_skipped'

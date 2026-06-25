@@ -82,3 +82,7 @@ python-service/test_tiered_kelly.py
 .vs/
 .vs
 
+python-service/tests/test_trade_daemon_order_status.py
+python-service/research/2026-06-24 - Copy.md
+python-service/research/2026-06-24.md
+python-service/__pycache__/main.cpython-313.pyc

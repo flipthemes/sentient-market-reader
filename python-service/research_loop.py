@@ -4,7 +4,7 @@ research_loop.py — Nightly self-evolution engine
 1. Fetches 30-day market + candle data (once, cached for all runs)
 2. Runs baseline backtest with current params
 3. Ablation study: varies one param at a time, finds best improvement
-4. Parses daemon trade logs for live performance data
+4. Parses daemon + webUI trade logs for live performance data
 5. Calls Claude API — analyzes results, writes a research report
 6. If any variation beats baseline by > 5%, creates a git branch
    with the proposed param change ready to review & merge
@@ -16,7 +16,7 @@ Usage:
   python3 research_loop.py --days 14    # shorten backtest window
 """
 
-import argparse, copy, json, math, os, re, subprocess, sys, time
+import argparse, copy, csv, json, math, os, re, subprocess, sys, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -71,7 +71,7 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
             if r:
                 records.append(r)
         records.sort(key=lambda r: r["entry_dt"])
-        final_cash = _bt.simulate(records)
+        final_cash = _bt.simulate(records, _bt.SIZING_MODE)
         executed   = [r for r in records if r.get("contracts", 0) > 0]
         wins       = [r for r in executed if r.get("outcome_sim", r["outcome"]) == "WIN"]
         losses     = [r for r in executed if r.get("outcome_sim", r["outcome"]) == "LOSS"]
@@ -93,6 +93,8 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
                 }
         return {
             "days_back":         days,
+            "sizing_mode":       _bt.SIZING_MODE,
+            "allowance_pct":     round(_bt.KELLY_FRACTION * 100, 2),
             "starting_cash":     _bt.STARTING_CASH,
             "final_cash":        round(final_cash, 2),
             "total_return_pct":  round((final_cash / _bt.STARTING_CASH - 1) * 100, 1),
@@ -112,11 +114,13 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
 
 # ── Log parser ─────────────────────────────────────────────────────────────────
 def parse_daemon_logs(days: int = 7) -> dict:
-    """Parse trade_daemon logs into summary stats."""
+    """Parse live trade logs (daemon + webUI CSV) into summary stats."""
     log_dir   = Path(__file__).parent / "logs"
     cutoff    = datetime.now(timezone.utc) - timedelta(days=days)
     trades    = []
     no_trades = []
+    daemon_trade_count = 0
+    webui_trade_count  = 0
 
     for log_file in sorted(log_dir.glob("daemon_*.log")):
         try:
@@ -143,6 +147,7 @@ def parse_daemon_logs(days: int = 7) -> dict:
                         "outcome": outcome, "pnl": pnl,
                         "ticker": ticker, "side": side, "price": int(price),
                     })
+                    daemon_trade_count += 1
                 except ValueError:
                     pass
                 continue
@@ -152,8 +157,45 @@ def parse_daemon_logs(days: int = 7) -> dict:
             if m2:
                 no_trades.append(m2.group(1).strip())
 
+    # Parse webUI trade logs: trade-log-YYYY-MM-DD.csv
+    for csv_file in sorted(log_dir.glob("trade-log-*.csv")):
+        try:
+            date_str = csv_file.stem.replace("trade-log-", "")
+            file_dt  = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if file_dt < cutoff - timedelta(days=1):
+                continue
+        except ValueError:
+            continue
+
+        try:
+            with csv_file.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    status = (row.get("status") or "").strip().lower()
+                    if status not in {"won", "lost", "win", "loss"}:
+                        continue
+
+                    outcome = "WIN" if status in {"won", "win"} else "LOSS"
+                    try:
+                        pnl_raw = float((row.get("pnl") or "0").strip())
+                        price   = int(float((row.get("limitPrice") or "0").strip()))
+                    except ValueError:
+                        continue
+
+                    pnl = abs(pnl_raw) if outcome == "WIN" else -abs(pnl_raw)
+                    trades.append({
+                        "outcome": outcome,
+                        "pnl": pnl,
+                        "ticker": (row.get("marketTicker") or row.get("windowKey") or "").strip(),
+                        "side": (row.get("side") or "").strip().upper(),
+                        "price": price,
+                    })
+                    webui_trade_count += 1
+        except OSError:
+            continue
+
     if not trades:
-        return {"available": False, "message": "No settled trades in daemon logs yet"}
+        return {"available": False, "message": "No settled trades in daemon/webUI logs yet"}
 
     wins   = [t for t in trades if t["outcome"] == "WIN"]
     losses = [t for t in trades if t["outcome"] == "LOSS"]
@@ -178,6 +220,10 @@ def parse_daemon_logs(days: int = 7) -> dict:
         "avg_loss":        round(sum(t["pnl"] for t in losses) / max(len(losses), 1), 2),
         "no_trade_count":  len(no_trades),
         "top_skip_reasons": top_reasons,
+        "source_counts": {
+            "daemon": daemon_trade_count,
+            "webui": webui_trade_count,
+        },
         "by_price": {
             "65-73¢": _bucket_stats(trades, 65, 73),
             "73-79¢": _bucket_stats(trades, 73, 79),
@@ -224,7 +270,9 @@ regime), Garman-Klass vol < 1.25×ref, timing window (6-9 min, or 3-12 for golde
 - MIN_MINUTES_LEFT = {_bt.MIN_MINUTES_LEFT}, MAX_MINUTES_LEFT = {_bt.MAX_MINUTES_LEFT}
 - BLOCKED_UTC_HOURS = {sorted(_bt.BLOCKED_UTC_HOURS)}
 - MIN_HURST = {_bt.MIN_HURST}, MAX_VOL_MULT = {_bt.MAX_VOL_MULT}
-- KELLY_FRACTION = {_bt.KELLY_FRACTION} (fractional Kelly sizing, tiered by price zone)
+- SIZING_MODE = {_bt.SIZING_MODE}
+- ALLOWANCE_PCT = {_bt.KELLY_FRACTION * 100:.0f}%
+- KELLY_FRACTION = {_bt.KELLY_FRACTION} (UI-aligned allowance fraction: bankroll × fraction per wager)
 
 ## 30-day backtest baseline
 {json.dumps(baseline, indent=2)}
@@ -242,11 +290,11 @@ Score improvement: {score(best) - score(baseline):+.1f} (current: {score(baselin
 
     if live.get("available"):
         ctx += f"""
-## Live daemon performance ({live.get('total_trades', 0)} settled trades)
+## Live performance (daemon + webUI, {live.get('total_trades', 0)} settled trades)
 {json.dumps(live, indent=2)}
 """
     else:
-        ctx += "\n## Live daemon performance: not yet available (daemon just started)\n"
+        ctx += "\n## Live performance: not yet available (no settled daemon/webUI trades yet)\n"
 
     prompt = ctx + """
 ## Your task
@@ -328,9 +376,15 @@ def propose_branch(best: dict, baseline_score: float) -> Optional[str]:
 def main():
     parser = argparse.ArgumentParser(description="Sentient research loop")
     parser.add_argument("--days",       type=int,  default=30,    help="Backtest lookback days")
+    parser.add_argument("--allowance-pct", type=float, default=20.0,
+                        help="Percent of bankroll allocated per wager in backtest (default: 20)")
+    parser.add_argument("--sizing-mode", choices=["allowance", "legacy-kelly"], default="allowance",
+                        help="Backtest sizing model for research runs")
     parser.add_argument("--no-claude",  action="store_true",      help="Skip Claude API call")
     parser.add_argument("--no-branch",  action="store_true",      help="Skip git branch creation")
     args = parser.parse_args()
+    _bt.KELLY_FRACTION = args.allowance_pct / 100.0
+    _bt.SIZING_MODE = args.sizing_mode
 
     research_dir = Path(__file__).parent / "research"
     research_dir.mkdir(exist_ok=True)
@@ -338,7 +392,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  Sentient Research Loop — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"  Backtest: {args.days} days | Claude: {not args.no_claude}")
+    print(f"  Backtest: {args.days} days | Mode: {args.sizing_mode} | Allowance: {args.allowance_pct:.0f}% | Claude: {not args.no_claude}")
     print(f"{'='*60}\n")
 
     # ── Step 1: Fetch data once ───────────────────────────────────────────────
@@ -401,8 +455,8 @@ def main():
     else:
         print("No variation beat the baseline.\n")
 
-    # ── Step 4: Parse daemon logs ─────────────────────────────────────────────
-    print("Parsing daemon logs...")
+    # ── Step 4: Parse live logs (daemon + webUI) ─────────────────────────────
+    print("Parsing live logs (daemon + webUI)...")
     live_stats = parse_daemon_logs(days=7)
     if live_stats.get("available"):
         print(f"  Live: {live_stats['total_trades']} trades | "
@@ -453,6 +507,12 @@ def main():
             f"| Avg win | ${live_stats['avg_win']:+.2f} |",
             f"| Avg loss | ${live_stats['avg_loss']:+.2f} |",
         ]
+        source_counts = live_stats.get("source_counts") or {}
+        if source_counts:
+            lines += [
+                f"| Daemon settled trades | {source_counts.get('daemon', 0)} |",
+                f"| WebUI settled trades | {source_counts.get('webui', 0)} |",
+            ]
         if live_stats.get("top_skip_reasons"):
             lines += ["", "**Top skip reasons:**", ""]
             for reason, count in live_stats["top_skip_reasons"]:

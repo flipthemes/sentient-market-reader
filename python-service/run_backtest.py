@@ -9,10 +9,11 @@ Signals:
   4. Velocity gate        — price not rushing toward strike >40% of crossing speed
   5. Vol ≤ 1.25×ref       — skip chaotic high-vol windows
   6. Entry 6–9 min left   — 6-9min = 98.3% WR on live fills
-Sizing: 20% fractional Kelly — scales with model confidence
+Sizing: fixed allowance per wager — bankroll × configured fraction
 Daily loss cap 3%. No price gates — ANY profit after fees is acceptable.
 """
 
+import argparse
 import math
 import time
 import logging
@@ -44,7 +45,7 @@ D_THRESHOLD          = 0.0
 D_MAX_THRESHOLD      = 99.0
 
 # Timing
-MIN_MINUTES_LEFT     = 3
+MIN_MINUTES_LEFT     = 4
 MAX_MINUTES_LEFT     = 9
 
 # Hurst
@@ -58,10 +59,11 @@ MARKOV_MIN_GAP       = 0.11
 MIN_PERSIST          = 0.82
 
 # Vol regime
-MAX_VOL_MULT         = 1.35
+MAX_VOL_MULT         = 20
 
-# Confidence-tiered flat risk (replaces Kelly)
-# risk_pct = min(20%, KELLY_FRACTION × kelly_full)
+# UI-aligned allowance sizing.
+# Use a fixed allowance equal to a configured fraction of current bankroll,
+# then buy as many contracts as that allowance can afford at the live cost.
 
 # Risk / sizing — side-specific entry price caps from live trade analysis (147 fills, Apr 19-22):
 # YES≤72¢: all buckets ≤72¢ are +EV. YES 72¢+ = -$9.34/trade (67% WR vs 76% needed).
@@ -69,15 +71,16 @@ MAX_VOL_MULT         = 1.35
 # Backtest unchanged: EMPIRICAL_PRICE_BY_D never generates NO above ~38¢, so NO cap is implicit.
 MIN_ENTRY_PRICE_RM   = 0     # no floor — let any price through
 MAX_ENTRY_PRICE_YES  = 72    # ¢ — YES cap: market underprices our momentum signal at ≤72¢
-MAX_ENTRY_PRICE_NO   = 65    # ¢ — NO cap: above 65¢ NO = consensus trade with bad payout ratio
+MAX_ENTRY_PRICE_NO   = 68    # ¢ — NO cap: above 65¢ NO = consensus trade with bad payout ratio
 MAX_ENTRY_PRICE_RM   = MAX_ENTRY_PRICE_YES  # kept for external imports expecting this name
-MIN_DIST_PCT         = 0.05
+MIN_DIST_PCT         = 0.04
 MAX_CONTRACTS_RM     = 500
 REF_VOL_15M          = 0.002
 MAX_TRADE_PCT        = 0.20
 KELLY_FRACTION       = 0.18
 DAEMON_MAX_TRADE_PCT = 0.35
 DAEMON_MAX_CONTRACTS = 50
+SIZING_MODE          = "allowance"
 MAX_TRADES_PER_DAY   = 48
 MAX_DAILY_LOSS_PCT   = 25
 MAX_DAILY_LOSS_FLOOR = 0
@@ -485,7 +488,7 @@ def process_market(mkt: dict, candles_15m: list, candles_5m: list) -> dict | Non
 
         rsi = compute_rsi(c5_closes) if len(c5_closes) >= 15 else None
 
-        # (no RSI gate — tested, hurts WR; Kelly already screens bad-EV trades)
+        # (no RSI gate — tested, hurts WR; EV/price gates already screen bad trades)
         # (no state-alignment gate — tested, counterproductive at gap=0.15)
 
         # Entry price from empirical table
@@ -547,7 +550,44 @@ def kalshi_fee(contracts: int, price_cents: float) -> float:
     return math.ceil(MAKER_FEE_RATE * contracts * p * (1 - p) * 100) / 100
 
 
-def simulate(records: list) -> float:
+def allowance_contracts(bankroll: float, total_cost_per_contract: float,
+                        allowance_fraction: float | None = None,
+                        max_contracts: int = DAEMON_MAX_CONTRACTS) -> tuple[float, int]:
+    if allowance_fraction is None:
+        allowance_fraction = KELLY_FRACTION
+    allowance = max(1.0, bankroll * allowance_fraction)
+    if total_cost_per_contract <= 0:
+        return allowance, 0
+    contracts = min(max(1, math.floor(allowance / total_cost_per_contract)), max_contracts)
+    return allowance, contracts
+
+
+def legacy_kelly_contracts(bankroll: float, total_cost_per_contract: float,
+                           p_win: float, limit_price_cents: float,
+                           max_contracts: int = DAEMON_MAX_CONTRACTS) -> tuple[float, float, int]:
+    p_dollars     = limit_price_cents / 100.0
+    fee_per_c_raw = MAKER_FEE_RATE * p_dollars * (1 - p_dollars)
+    net_win_per_c = (1.0 - p_dollars) - fee_per_c_raw
+    b_odds        = net_win_per_c / total_cost_per_contract if total_cost_per_contract > 0 else 1.0
+    kelly_full    = max(0.0, (b_odds * p_win - (1.0 - p_win)) / b_odds) if b_odds > 0 else 0.0
+
+    if 65 <= limit_price_cents <= 73:
+        frac = 0.35
+    elif 73 < limit_price_cents <= 79:
+        frac = 0.12
+    elif 79 < limit_price_cents <= 85:
+        frac = 0.08
+    else:
+        frac = 0.05
+
+    risk_pct  = min(DAEMON_MAX_TRADE_PCT, frac * kelly_full)
+    contracts = min(max(1, round(bankroll * risk_pct / total_cost_per_contract)), max_contracts)
+    return kelly_full, risk_pct, contracts
+
+
+def simulate(records: list, sizing_mode: str | None = None) -> float:
+    if sizing_mode is None:
+        sizing_mode = SIZING_MODE
     ET_OFFSET = timedelta(hours=5)
     cash = STARTING_CASH
     session_daily_pnl = session_peak_pnl = 0.0
@@ -581,23 +621,15 @@ def simulate(records: list) -> float:
         p_dollars        = lp / 100.0
         fee_per_c_raw    = MAKER_FEE_RATE * p_dollars * (1 - p_dollars)
         cost_per_contract = p_dollars + fee_per_c_raw
-
         p_win            = r['p_yes'] if r['side'] == 'yes' else (1.0 - r['p_yes'])
-        net_win_per_c    = (1.0 - p_dollars) - fee_per_c_raw
-        b_odds           = net_win_per_c / cost_per_contract if cost_per_contract > 0 else 1.0
-        kelly_full       = max(0.0, (b_odds * p_win - (1.0 - p_win)) / b_odds)
 
-        if 65 <= lp <= 73:
-            frac = 0.35
-        elif 73 < lp <= 79:
-            frac = 0.12
-        elif 79 < lp <= 85:
-            frac = 0.08
+        allowance  = None
+        kelly_full = None
+        risk_pct   = None
+        if sizing_mode == 'legacy-kelly':
+            kelly_full, risk_pct, contracts = legacy_kelly_contracts(cash, cost_per_contract, p_win, lp)
         else:
-            frac = 0.05
-
-        risk_pct         = min(DAEMON_MAX_TRADE_PCT, frac * kelly_full)
-        contracts        = min(max(1, round(cash * risk_pct / cost_per_contract)), DAEMON_MAX_CONTRACTS)
+            allowance, contracts = allowance_contracts(cash, cost_per_contract)
 
         avg_cents = (SLIPPAGE_FREE_CTRS * lp + (contracts - SLIPPAGE_FREE_CTRS) *
                      (lp + (contracts - SLIPPAGE_FREE_CTRS) * SLIPPAGE_CENTS_PER / 2)
@@ -614,15 +646,117 @@ def simulate(records: list) -> float:
         session_peak_pnl     = max(session_peak_pnl, session_daily_pnl)
         session_trade_count += 1
 
-        r.update(contracts=contracts, cost=round(contracts * (p_eff + fee_per_c), 2),
-                 pnl=round(pnl, 2), cash_after=round(cash, 2), outcome_sim=r['outcome'])
+        update = {
+            'sizing_mode': sizing_mode,
+            'contracts': contracts,
+            'cost': round(contracts * (p_eff + fee_per_c), 2),
+            'pnl': round(pnl, 2),
+            'cash_after': round(cash, 2),
+            'outcome_sim': r['outcome'],
+        }
+        if allowance is not None:
+            update['allowance_pct'] = round(KELLY_FRACTION * 100, 2)
+            update['allowance'] = round(allowance, 2)
+        if kelly_full is not None and risk_pct is not None:
+            update['kelly_full'] = round(kelly_full, 6)
+            update['risk_pct'] = round(risk_pct, 6)
+        r.update(update)
 
     return cash
+
+
+def summarize_run(markets: list, records: list, final_cash: float, sizing_mode: str) -> dict:
+    executed   = [r for r in records if r.get('contracts', 0) > 0]
+    skipped_rm = [r for r in records if r.get('contracts', 0) == 0]
+    wins       = [r for r in executed if r.get('outcome_sim', r['outcome']) == 'WIN']
+    losses     = [r for r in executed if r.get('outcome_sim', r['outcome']) == 'LOSS']
+    strong     = [r for r in executed if r.get('enter_signal')]
+    strong_w   = [r for r in strong if r.get('outcome_sim', r['outcome']) == 'WIN']
+
+    skip_reasons: dict = {}
+    for r in skipped_rm:
+        key = r.get('skipped_reason', 'unknown')
+        skip_reasons[key] = skip_reasons.get(key, 0) + 1
+
+    max_cash = STARTING_CASH
+    max_dd = 0.0
+    cur_s = max_ws = max_ls = 0
+    last_oc = None
+    for r in executed:
+        oc = r.get('outcome_sim', r['outcome'])
+        max_cash = max(max_cash, r['cash_after'])
+        max_dd   = max(max_dd, (max_cash - r['cash_after']) / max_cash * 100)
+        cur_s    = cur_s + 1 if oc == last_oc else 1
+        if oc == 'WIN':
+            max_ws = max(max_ws, cur_s)
+        else:
+            max_ls = max(max_ls, cur_s)
+        last_oc = oc
+
+    wr       = len(wins) / max(len(executed), 1) * 100
+    pnl      = final_cash - STARTING_CASH
+    ret_pct  = (final_cash / STARTING_CASH - 1) * 100
+    avg_win  = sum(r['pnl'] for r in wins) / max(len(wins), 1)
+    avg_loss = sum(r['pnl'] for r in losses) / max(len(losses), 1)
+    gw       = sum(r['pnl'] for r in wins)
+    gl       = abs(sum(r['pnl'] for r in losses))
+
+    return {
+        'sizing_mode': sizing_mode,
+        'markets': markets,
+        'records': records,
+        'final_cash': final_cash,
+        'executed': executed,
+        'skipped_rm': skipped_rm,
+        'wins': wins,
+        'losses': losses,
+        'strong': strong,
+        'strong_w': strong_w,
+        'skip_reasons': skip_reasons,
+        'max_cash': max_cash,
+        'max_dd': max_dd,
+        'wr': wr,
+        'pnl': pnl,
+        'ret_pct': ret_pct,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'gw': gw,
+        'gl': gl,
+        'max_ws': max_ws,
+        'max_ls': max_ls,
+    }
+
+
+def print_compare_summary(allowance_summary: dict, legacy_summary: dict) -> None:
+    print("\n" + "=" * 86)
+    print("  SIZING MODE COMPARISON")
+    print("=" * 86)
+    print(f"  {'Metric':<24} {'Allowance':>14} {'Legacy Kelly':>16}")
+    print("  " + "-" * 56)
+    print(f"  {'Allowance pct':<24} {f'{KELLY_FRACTION*100:.0f}%':>14} {'edge-scaled':>16}")
+    print(f"  {'Executed trades':<24} {len(allowance_summary['executed']):>14} {len(legacy_summary['executed']):>16}")
+    print(f"  {'Win rate':<24} {f"{allowance_summary['wr']:.1f}%":>14} {f"{legacy_summary['wr']:.1f}%":>16}")
+    print(f"  {'Return':<24} {f"{allowance_summary['ret_pct']:+.1f}%":>14} {f"{legacy_summary['ret_pct']:+.1f}%":>16}")
+    print(f"  {'Max drawdown':<24} {f"{allowance_summary['max_dd']:.1f}%":>14} {f"{legacy_summary['max_dd']:.1f}%":>16}")
+    print(f"  {'Final cash':<24} {f"${allowance_summary['final_cash']:.2f}":>14} {f"${legacy_summary['final_cash']:.2f}":>16}")
+    print(f"  {'Profit factor':<24} {f"{allowance_summary['gw']/max(allowance_summary['gl'],0.01):.2f}x":>14} {f"{legacy_summary['gw']/max(legacy_summary['gl'],0.01):.2f}x":>16}")
+    print("=" * 86)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    global KELLY_FRACTION, SIZING_MODE
+
+    parser = argparse.ArgumentParser(description="KXBTC15M sizing backtest")
+    parser.add_argument("--allowance-pct", type=float, default=20.0,
+                        help="Percent of bankroll allocated per wager (default: 20)")
+    parser.add_argument("--sizing-mode", choices=["allowance", "legacy-kelly", "compare"], default="allowance",
+                        help="Backtest sizing model: live-matching allowance, legacy Kelly, or side-by-side compare")
+    args = parser.parse_args()
+    KELLY_FRACTION = args.allowance_pct / 100.0
+    SIZING_MODE = args.sizing_mode if args.sizing_mode != 'compare' else 'allowance'
+
     log.info(f"=== Directional KXBTC15M Backtest · {DAYS_BACK}d · ${STARTING_CASH} start ===")
 
     markets     = fetch_settled_markets(DAYS_BACK)
@@ -647,37 +781,34 @@ def main():
     if not records:
         print("No qualifying trades"); return
 
-    final      = simulate(records)
-    executed   = [r for r in records if r.get('contracts', 0) > 0]
-    skipped_rm = [r for r in records if r.get('contracts', 0) == 0]
-    wins       = [r for r in executed if r.get('outcome_sim', r['outcome']) == 'WIN']
-    losses     = [r for r in executed if r.get('outcome_sim', r['outcome']) == 'LOSS']
-    strong     = [r for r in executed if r.get('enter_signal')]
-    strong_w   = [r for r in strong   if r.get('outcome_sim', r['outcome']) == 'WIN']
+    if args.sizing_mode == 'compare':
+        allowance_records = [r.copy() for r in records]
+        legacy_records    = [r.copy() for r in records]
+        allowance_summary = summarize_run(markets, allowance_records, simulate(allowance_records, 'allowance'), 'allowance')
+        legacy_summary    = summarize_run(markets, legacy_records, simulate(legacy_records, 'legacy-kelly'), 'legacy-kelly')
+        print_compare_summary(allowance_summary, legacy_summary)
+        return
 
-    skip_reasons: dict = {}
-    for r in skipped_rm:
-        k = r.get('skipped_reason', 'unknown')
-        skip_reasons[k] = skip_reasons.get(k, 0) + 1
-
-    max_cash = STARTING_CASH; max_dd = 0.0
-    cur_s = max_ws = max_ls = 0; last_oc = None
-    for r in executed:
-        oc = r.get('outcome_sim', r['outcome'])
-        max_cash = max(max_cash, r['cash_after'])
-        max_dd   = max(max_dd, (max_cash - r['cash_after']) / max_cash * 100)
-        cur_s    = cur_s + 1 if oc == last_oc else 1
-        if oc == 'WIN': max_ws = max(max_ws, cur_s)
-        else:           max_ls = max(max_ls, cur_s)
-        last_oc = oc
-
-    wr       = len(wins) / max(len(executed), 1) * 100
-    pnl      = final - STARTING_CASH
-    ret_pct  = (final / STARTING_CASH - 1) * 100
-    avg_win  = sum(r['pnl'] for r in wins)   / max(len(wins), 1)
-    avg_loss = sum(r['pnl'] for r in losses) / max(len(losses), 1)
-    gw       = sum(r['pnl'] for r in wins)
-    gl       = abs(sum(r['pnl'] for r in losses))
+    final      = simulate(records, args.sizing_mode)
+    summary    = summarize_run(markets, records, final, args.sizing_mode)
+    executed   = summary['executed']
+    skipped_rm = summary['skipped_rm']
+    wins       = summary['wins']
+    losses     = summary['losses']
+    strong     = summary['strong']
+    strong_w   = summary['strong_w']
+    skip_reasons = summary['skip_reasons']
+    max_cash   = summary['max_cash']
+    max_dd     = summary['max_dd']
+    max_ws     = summary['max_ws']
+    max_ls     = summary['max_ls']
+    wr         = summary['wr']
+    pnl        = summary['pnl']
+    ret_pct    = summary['ret_pct']
+    avg_win    = summary['avg_win']
+    avg_loss   = summary['avg_loss']
+    gw         = summary['gw']
+    gl         = summary['gl']
     period   = f"{records[0]['entry_dt'][:16]} → {records[-1]['entry_dt'][:16]} UTC"
 
     W = 108
@@ -686,7 +817,10 @@ def main():
     price_gate_str = f"entry≤{MAX_ENTRY_PRICE_RM}¢ (market efficiency)" if MAX_ENTRY_PRICE_RM > 0 else "no price gate"
     print(f"  Filters: Markov gap≥{MARKOV_MIN_GAP} · 6-9min · Hurst>{MIN_HURST} · vel<{VEL_SAFETY_RATIO:.0%}×cross · vol≤{MAX_VOL_MULT}×ref · {price_gate_str}")
     print("=" * W)
-    print(f"  {f'Sizing: {int(KELLY_FRACTION*100)}% fractional Kelly':<40} {f'min({int(MAX_TRADE_PCT*100)}%, {KELLY_FRACTION}×f*)':>8}")
+    if args.sizing_mode == 'legacy-kelly':
+        print(f"  {'Sizing: legacy Kelly':<40} {'edge-scaled + price tier':>24}")
+    else:
+        print(f"  {f'Sizing: {int(KELLY_FRACTION*100)}% allowance per wager':<40} {f'bankroll × {KELLY_FRACTION:.2f}':>24}")
     print(f"  {'Windows total':<40} {len(markets):>8}")
     print(f"  {'Qualified (all gates pass)':<40} {len(records):>8}  ({len(records)/max(len(markets),1)*100:.1f}%)")
     print(f"  {'Executed by agent':<40} {len(executed):>8}")

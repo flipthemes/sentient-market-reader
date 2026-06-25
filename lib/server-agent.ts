@@ -942,6 +942,8 @@ class ServerAgent extends EventEmitter {
       let liveOrderId: string | undefined
       let orderErrorMsg: string | undefined
       let iocUnfilled   = false   // IOC with no fill — skip window, don't retry
+      let filledContracts = 0
+      let filledCost = 0
 
       {
         try {
@@ -980,9 +982,10 @@ class ServerAgent extends EventEmitter {
 
           if (wasFilled(res)) {
             liveOrderId = res.order!.order_id
-            const actualFillCount = res.order!.fill_count ?? contracts
-            console.log(`[ServerAgent] IOC filled ${actualFillCount} contracts`)
-            limitSellOrder({ ticker: exec.marketTicker, side: exec.side, count: actualFillCount })
+            filledContracts = Math.max(1, res.order!.fill_count ?? contracts)
+            filledCost = filledContracts * costPerContract
+            console.log(`[ServerAgent] IOC filled ${filledContracts} contracts`)
+            limitSellOrder({ ticker: exec.marketTicker, side: exec.side, count: filledContracts })
               .then(sr => {
                 if (!sr.ok) console.warn(`[ServerAgent] limit-sell failed: ${sr.error}`)
                 else console.log(`[ServerAgent] ✓ Limit-sell placed @ 99¢ on ${exec.marketTicker}`)
@@ -1008,14 +1011,15 @@ class ServerAgent extends EventEmitter {
         sliceNum:         1,
         side:             exec.side,
         limitPrice:       liveLimitPrice,
-        contracts,
-        cost,
+        contracts:        liveOrderId ? filledContracts : 0,
+        cost:             liveOrderId ? filledCost : 0,
         marketTicker:     exec.marketTicker,
         strikePrice:      md.strikePrice,
         btcPriceAtEntry:  pf.currentPrice,
         expiresAt:        md.activeMarket.close_time,
         enteredAt:        new Date().toISOString(),
-        status:           'open',
+        status:           liveOrderId ? 'open' : 'lost',
+        pnl:              liveOrderId ? undefined : 0,
         pModel:           prob.pModel,
         pMarket:          prob.pMarket,
         edge:             prob.edge,
@@ -1044,9 +1048,9 @@ class ServerAgent extends EventEmitter {
         this.orderError      = null
         this.agentPhase      = 'bet_placed'
         if (this.kellyMode) {
-          this.bankroll = Math.max(1, this.bankroll - cost) // reserve the bet
+          this.bankroll = Math.max(1, this.bankroll - filledCost) // reserve only filled size
         }
-        console.log(`[ServerAgent] ✓ Bet placed — ${exec.side.toUpperCase()} ${contracts}× @ ${liveLimitPrice}¢ on ${evTicker}`)
+        console.log(`[ServerAgent] ✓ Bet placed — ${exec.side.toUpperCase()} ${filledContracts}× @ ${liveLimitPrice}¢ on ${evTicker}`)
       } else if (iocUnfilled) {
         // No liquidity or price cap — skip this window, don't retry (would just loop)
         this.orderError  = orderErrorMsg ?? 'Skipped — no fill'

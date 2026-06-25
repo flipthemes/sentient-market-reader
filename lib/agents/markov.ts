@@ -61,6 +61,12 @@ const BASE_ORDER_CAP   = 25     // contracts at BASE_BANKROLL
 const MIN_GAP        = 0.11   // |pYes − 0.5| must be ≥ this — matches backtest gate
 const PERSIST_TAU    = 0.80   // momentum self-persistence threshold (mirrors chain.ts)
 
+function getMaxVolMult(): number {
+  const raw = process.env.MAX_VOL_MULT ?? process.env.NEXT_PUBLIC_MAX_VOL_MULT
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) && n > 0 ? n : 1.25
+}
+
 export function runMarkovAgent(
   distanceFromStrikePct: number,
   strikePrice: number,
@@ -121,9 +127,11 @@ export function runMarkovAgent(
   // Under 1 minute left, time decay dominates — skip the persist gate entirely.
   const activeMinGap      = minGapOverride     ?? MIN_GAP
   const activePersistTau  = persistTauOverride ?? PERSIST_TAU
+  const activeMaxVolMult  = getMaxVolMult()
   const effectivePersistTau = T <= 1 ? 0 : activePersistTau
+  const volOk   = gkVol15m == null || gkVol15m <= REFERENCE_VOL * activeMaxVolMult
   const gap     = Math.abs(pYes - 0.5)
-  const gateOk  = hasHistory && forecast.persist >= effectivePersistTau && gap >= activeMinGap
+  const gateOk  = hasHistory && volOk && forecast.persist >= effectivePersistTau && gap >= activeMinGap
 
   const recommendation: 'YES' | 'NO' | 'NO_TRADE' =
     !gateOk     ? 'NO_TRADE' :
@@ -134,7 +142,9 @@ export function runMarkovAgent(
   const rejectionReason = !hasHistory
     ? `Building momentum history (${historyLength}/${MIN_HISTORY} observations)`
     : !gateOk
-    ? forecast.persist < activePersistTau && gap < activeMinGap
+    ? !volOk
+      ? `Volatility too high — GK ${(gkVol15m! * 100).toFixed(3)}%/candle exceeds cap ${(REFERENCE_VOL * activeMaxVolMult * 100).toFixed(3)}%/candle`
+      : forecast.persist < activePersistTau && gap < activeMinGap
       ? `Not confident enough (${(50 + gap * 100).toFixed(1)}% sure, need ${(50 + activeMinGap * 100).toFixed(0)}%+) and BTC momentum is too choppy (need ${(activePersistTau * 100).toFixed(0)}%+ consistency)`
       : forecast.persist < activePersistTau
       ? `BTC momentum is too choppy to call — only ${(forecast.persist * 100).toFixed(0)}% consistent (need ${(activePersistTau * 100).toFixed(0)}%+)`

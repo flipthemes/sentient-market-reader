@@ -26,8 +26,10 @@ from run_backtest import (
     build_markov_history, build_transition_matrix, predict_from_momentum,
     price_change_to_state, gk_vol, compute_hurst,
     MARKOV_MIN_GAP, MIN_PERSIST, KELLY_FRACTION, MAX_TRADE_PCT,
+    MIN_MINUTES_LEFT, MAX_MINUTES_LEFT,
     MAX_ENTRY_PRICE_RM, MAX_ENTRY_PRICE_YES, MAX_ENTRY_PRICE_NO,
     MAKER_FEE_RATE, EMPIRICAL_PRICE_BY_D, BLOCKED_UTC_HOURS,
+    allowance_contracts,
 )
 
 # ── Env / config ────────────────────────────────────────────────────────────[...]
@@ -48,6 +50,8 @@ MAX_GIVEBACK_X      = 1.5    # stop if peak P&L drops by this × MAX_DAILY_LOSS
 MAX_DAILY_TRADES    = 48
 DAEMON_MAX_TRADE_PCT = 0.35
 DAEMON_MAX_CONTRACTS = 50
+ENTRY_WINDOW_MINUTES_LEFT = float(MIN_MINUTES_LEFT)
+ENTRY_WINDOW_MAX_MINUTES_LEFT = float(MAX_MINUTES_LEFT)
 
 # ── Logging ─────────────────────────────────────────────────────────────[...]
 _log_dir = Path(__file__).parent / "logs"
@@ -176,14 +180,17 @@ def fmt(secs: float) -> str:
 
 def should_retry_window(mins_left: float, reasons: list[str]) -> bool:
     """Continue reevaluating the window while it is still in the active entry period."""
-    return mins_left > 3.5
+    # Keep checking until we reach the same late cutoff used by the main loop.
+    # This avoids dropping windows too early (e.g., around 3.4 min left) now that
+    # the configured entry range is 3-9 minutes.
+    return mins_left > max(2.5, ENTRY_WINDOW_MINUTES_LEFT - 0.5)
 
 
 def retry_delay_for_window(mins_left: float) -> float:
-    """Poll more aggressively inside the active 6–9 minute entry window."""
+    """Poll more aggressively inside the active 3–9 minute entry window."""
     if mins_left <= 6.0:
         return 3.0
-    if mins_left <= 9.0:
+    if mins_left <= ENTRY_WINDOW_MAX_MINUTES_LEFT:
         return 4.0
     return 5.0
 
@@ -268,7 +275,7 @@ async def get_btc_price() -> float:
         return 0.0
 
 
-async def run_signal(market: dict, bankroll: float) -> dict:
+async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -> dict:
     strike   = float(market.get("floor_strike") or 0)
     yes_ask  = int(market.get("yes_ask") or 50)
     no_ask   = int(market.get("no_ask")  or 50)
@@ -336,8 +343,9 @@ async def run_signal(market: dict, bankroll: float) -> dict:
     vol_ok    = gk is None or gk <= 0.002 * 1.25
     hurst_ok  = hurst is None or hurst >= 0.50
     markov_ok = has_history and gap >= MARKOV_MIN_GAP and persist >= MIN_PERSIST
+    # Informational tag only; entry timing now always uses ENTRY_WINDOW_*.
     is_golden = 65 <= yes_ask <= 73
-    time_ok   = (3 <= minutes_left <= 12) if is_golden else (6 <= minutes_left <= 9)
+    time_ok   = ENTRY_WINDOW_MINUTES_LEFT <= minutes_left <= ENTRY_WINDOW_MAX_MINUTES_LEFT
     side_is_yes = p_yes > 0.5
     limit_price = round(yes_ask if side_is_yes else no_ask)
     price_cap   = MAX_ENTRY_PRICE_YES if side_is_yes else MAX_ENTRY_PRICE_NO
@@ -350,30 +358,22 @@ async def run_signal(market: dict, bankroll: float) -> dict:
     if blocked:          reasons.append(f"blocked UTC hour {utc_hour}:00")
     if not vol_ok:       reasons.append(f"high vol (GK={gk:.5f})")
     if not hurst_ok:     reasons.append(f"mean-reverting (Hurst={hurst:.2f})")
-    if not time_ok:      reasons.append(f"timing {minutes_left:.1f}min outside {'3-12' if is_golden else '6-9'}min window")
+    if not time_ok:      reasons.append(f"timing {minutes_left:.1f}min outside {ENTRY_WINDOW_MINUTES_LEFT:.0f}-{ENTRY_WINDOW_MAX_MINUTES_LEFT:.0f}min window")
     if not price_ok:     reasons.append(f"price {limit_price}¢ > {'YES' if side_is_yes else 'NO'} cap {price_cap}¢")
     if not dist_ok:      reasons.append(f"near-strike noise ({dist_pct:.4f}%)")
 
     all_ok = markov_ok and not blocked and vol_ok and hurst_ok and time_ok and price_ok and dist_ok
     rec    = ("YES" if p_yes > 0.5 else "NO") if all_ok else "NO_TRADE"
 
-    # Kelly sizing
+    # UI-aligned allowance sizing
     p_win     = p_yes if rec == "YES" else (1 - p_yes)
     p_d       = limit_price / 100
     fee_c     = MAKER_FEE_RATE * p_d * (1 - p_d)
     net_win   = (1 - p_d) - fee_c
     cost_c    = p_d + fee_c
-    b         = net_win / cost_c if cost_c > 0 else 1.0
-    kelly_full = max(0.0, (b * p_win - (1 - p_win)) / b) if rec != "NO_TRADE" else 0.0
-
-    if   65 <= limit_price <= 73: frac = 0.35
-    elif 73 < limit_price <= 79:  frac = 0.12
-    elif 73 < limit_price <= 85:  frac = 0.08
-    else:                         frac = 0.05
-
-    risk_pct  = min(DAEMON_MAX_TRADE_PCT, frac * kelly_full)
-    dyn_cap   = DAEMON_MAX_CONTRACTS
-    contracts = min(max(1, round(bankroll * risk_pct / cost_c)), dyn_cap) if rec != "NO_TRADE" else 0
+    allowance, contracts = allowance_contracts(
+        bankroll, cost_c, allowance_fraction=allowance_fraction, max_contracts=DAEMON_MAX_CONTRACTS,
+    ) if rec != "NO_TRADE" else (max(1.0, bankroll * allowance_fraction), 0)
     max_loss  = round(cost_c * contracts, 2)
     ev        = round(contracts * (net_win * p_win - cost_c * (1 - p_win)), 2)
 
@@ -382,6 +382,8 @@ async def run_signal(market: dict, bankroll: float) -> dict:
         "recommendation":  rec,
         "ticker":          ticker,
         "limit_price":     limit_price,
+        "allowance_pct":   round(allowance_fraction * 100, 2),
+        "allowance_usd":   round(allowance, 2),
         "contracts":       contracts,
         "max_loss_usd":    max_loss,
         "expected_value":  ev,
@@ -514,10 +516,10 @@ async def check_settlement(ticker: str) -> Optional[str]:
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────[...]
-async def main_loop(dry_run: bool, bankroll: float):
+async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
     session = Session(bankroll)
     log.info("=" * 65)
-    log.info(f"  Sentient Trading Daemon  |  dry_run={dry_run}  |  bankroll=${bankroll:.0f}")
+    log.info(f"  Sentient Trading Daemon  |  dry_run={dry_run}  |  bankroll=${bankroll:.0f}  |  allowance={allowance_fraction*100:.0f}%")
     log.info("=" * 65)
 
     # Try fetching live balance at startup
@@ -570,9 +572,9 @@ async def main_loop(dry_run: bool, bankroll: float):
         mins_left = (close_dt - now).total_seconds() / 60
         window_id = close_dt.strftime("%Y%m%d%H%M")
 
-        # Sleep until 12 min before close (entry window opens)
-        if mins_left > 12.5:
-            sleep_s = (mins_left - 12) * 60
+        # Sleep until entry window opens.
+        if mins_left > ENTRY_WINDOW_MAX_MINUTES_LEFT + 0.5:
+            sleep_s = (mins_left - ENTRY_WINDOW_MAX_MINUTES_LEFT) * 60
             log.info(
                 f"Next window {window_id} closes in {mins_left:.1f} min "
                 f"— sleeping {fmt(sleep_s)}"
@@ -610,7 +612,7 @@ async def main_loop(dry_run: bool, bankroll: float):
             continue
 
         try:
-            signal = await run_signal(market, session.bankroll)
+            signal = await run_signal(market, session.bankroll, allowance_fraction)
         except Exception as e:
             log.error(f"Signal error: {e}", exc_info=True)
             await asyncio.sleep(30)
@@ -630,7 +632,7 @@ async def main_loop(dry_run: bool, bankroll: float):
             f"BTC ${mkt['btc_price']:,.0f} | Strike ${mkt['strike']:,.0f} | "
             f"Δ{mkt['dist_pct']:+.3f}% | {sig['minutes_left']:.1f}min | "
             f"p(YES)={sig['p_yes']:.1%} gap={sig['gap']:.3f} persist={sig['persist']:.2f} "
-            f"{'[GOLDEN]' if sig['is_golden'] else ''}"
+            f"{'[YES65-73]' if sig['is_golden'] else ''}"
         )
 
         if not approved:
@@ -656,6 +658,7 @@ async def main_loop(dry_run: bool, bankroll: float):
 
         log.info(
             f"{'[DRY RUN] ' if dry_run else ''}TRADE  BUY {rec} {contracts}c @ {limit_price}¢  "
+            f"allowance={signal['allowance_pct']:.0f}% (${signal['allowance_usd']:.2f})  "
             f"max_loss=${signal['max_loss_usd']:.2f}  EV=${signal['expected_value']:+.2f}  "
             f"ticker={ticker}"
         )
@@ -735,9 +738,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sentient autonomous trading daemon")
     parser.add_argument("--dry-run",   action="store_true", help="Simulate trades, no real orders")
     parser.add_argument("--bankroll",  type=float, default=200.0, help="Starting bankroll in USD")
+    parser.add_argument("--allowance-pct", type=float, default=20.0,
+                        help="Percent of bankroll allocated per wager (default: 20)")
     args = parser.parse_args()
 
     try:
-        asyncio.run(main_loop(dry_run=args.dry_run, bankroll=args.bankroll))
+        asyncio.run(main_loop(
+            dry_run=args.dry_run,
+            bankroll=args.bankroll,
+            allowance_fraction=args.allowance_pct / 100.0,
+        ))
     except KeyboardInterrupt:
         log.info("Daemon stopped by user.")
