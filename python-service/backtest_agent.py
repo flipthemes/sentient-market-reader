@@ -34,8 +34,8 @@ _SESSION.headers.update({"User-Agent": "sentient-agent-backtest/1.0"})
 MARKOV_MIN_GAP  = 0.11
 MIN_PERSIST     = 0.82
 MAX_ENTRY_PRICE = 72
-MAX_VOL_MULT    = 1.25
-MIN_HURST       = 0.50
+MAX_VOL_MULT    = 1.35
+MIN_HURST       = 0.45
 MAKER_FEE_RATE  = 0.0175
 MAX_TRADE_PCT   = 0.20
 BLOCKED_HOURS   = {11, 18}

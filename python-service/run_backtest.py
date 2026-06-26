@@ -48,7 +48,7 @@ MIN_MINUTES_LEFT     = 3
 MAX_MINUTES_LEFT     = 9
 
 # Hurst
-MIN_HURST            = 0.40            # 0.45 my setting 0.50 default
+MIN_HURST            = 0.45            # 0.50 default
 # Velocity gate
 VEL_SAFETY_RATIO     = 0.40
 
@@ -57,7 +57,7 @@ MARKOV_MIN_GAP       = 0.11
 MIN_PERSIST          = 0.82
 
 # Vol regime
-MAX_VOL_MULT         = 1.4
+MAX_VOL_MULT         = 1.35
 
 # UI-aligned allowance sizing.
 # Use a fixed allowance equal to a configured fraction of current bankroll,
@@ -69,7 +69,7 @@ MAX_VOL_MULT         = 1.4
 # Backtest unchanged: EMPIRICAL_PRICE_BY_D never generates NO above ~38¢, so NO cap is implicit.
 MIN_ENTRY_PRICE_RM   = 0     # no floor — let any price through
 MAX_ENTRY_PRICE_YES  = 72    # ¢ — YES cap: market underprices our momentum signal at ≤72¢
-MAX_ENTRY_PRICE_NO   = 68    # ¢ — NO cap: above 65¢ NO = consensus trade with bad payout ratio
+MAX_ENTRY_PRICE_NO   = 65    # ¢ — NO cap: above 65¢ NO = consensus trade with bad payout ratio
 MAX_ENTRY_PRICE_RM   = MAX_ENTRY_PRICE_YES  # kept for external imports expecting this name
 MIN_DIST_PCT         = 0.04
 MAX_CONTRACTS_RM     = 500

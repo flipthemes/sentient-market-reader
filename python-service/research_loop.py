@@ -43,7 +43,7 @@ PARAM_GRID = [
     ("MIN_MINUTES_LEFT",  [3,    4,    5,    6,    7],              "Min minutes left"),
     ("MAX_MINUTES_LEFT",  [8,    9,    10,   11,   12],             "Max minutes left"),
     ("MAX_VOL_MULT",      [1.10, 1.15, 1.25, 1.35, 1.50],         "Max vol multiplier"),
-    ("MIN_HURST",         [0.45, 0.48, 0.50, 0.52, 0.55],         "Min Hurst exponent"),
+    ("MIN_HURST",         [0.35, 0.40, 0.45, 0.50, 0.55],         "Min Hurst exponent"),
 ]
 
 # Score = total_return_pct × win_rate_pct / max(max_drawdown_pct, 1)
@@ -92,16 +92,36 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
                     "pnl":    round(sum(r["pnl"] for r in bt_), 2),
                 }
         time_buckets = {}
-        # Keep windows adjacent and non-overlapping: [6,9) and [3,6)
-        for lo, hi, label in [(6, 9, "9-6m"), (3, 6, "6-3m")]:
-            bt_ = [r for r in executed if lo <= (r.get("minutes_left") or 0) < hi]
+        # Windows are adjacent and fully cover the configured 3-9 minute entry range.
+        # Include 9.0 in the upper bucket to avoid dropping exact-boundary fills.
+        windows = [
+            (6, 9, "9-6m", True),
+            (3, 6, "6-3m", False),
+        ]
+        covered_ids = set()
+        for lo, hi, label, include_hi in windows:
+            if include_hi:
+                bt_ = [r for r in executed if lo <= (r.get("minutes_left") or 0) <= hi]
+            else:
+                bt_ = [r for r in executed if lo <= (r.get("minutes_left") or 0) < hi]
             bw  = [r for r in bt_ if r.get("outcome_sim", r["outcome"]) == "WIN"]
             if bt_:
+                covered_ids.update(id(r) for r in bt_)
                 time_buckets[label] = {
                     "trades": len(bt_),
                     "wr":     round(len(bw)/len(bt_)*100, 1),
                     "pnl":    round(sum(r["pnl"] for r in bt_), 2),
                 }
+
+        # Keep coverage explicit if any record falls outside expected 3-9m windows.
+        uncovered = [r for r in executed if id(r) not in covered_ids]
+        if uncovered:
+            uw = [r for r in uncovered if r.get("outcome_sim", r["outcome"]) == "WIN"]
+            time_buckets["outside_window"] = {
+                "trades": len(uncovered),
+                "wr":     round(len(uw)/len(uncovered)*100, 1),
+                "pnl":    round(sum(r["pnl"] for r in uncovered), 2),
+            }
         return {
             "days_back":         days,
             "sizing_mode":       _bt.SIZING_MODE,

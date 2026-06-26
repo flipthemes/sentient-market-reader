@@ -39,7 +39,7 @@ const RISK_PARAMS = {
   minDistancePct:   0.04,  // skip near-ATM trades — backtest: 0.05 gives 336 trades @76.8% WR vs 0.10 gives 173 @85% (more volume, better absolute return)
   minEntryPrice:     0,    // no floor — 62¢ and 71¢ zones both profitable
   maxEntryPriceYes: 72,    // ¢ — YES: live data shows YES 55-72¢ all +EV; YES 72¢+ = -$9.34/trade 
-  maxEntryPriceNo:  68,    // ¢ — NO cap lower: NO 65-72¢ = -$7.71/trade (53% WR vs 69% needed). Above 65¢ NO is consensus-following with bad payout. **I CHANGED IT TO +2**
+  maxEntryPriceNo:  65,    // ¢ — NO cap lower: NO 65-72¢ = -$7.71/trade (53% WR vs 69% needed). Above 65¢ NO is consensus-following with bad payout. **I CHANGED IT TO +2**
   maxTradePct:      15,    // % of portfolio per trade
 }
 // Computed giveback limit: how far (in $) today's P&L can fall from its peak before we stop.

@@ -364,8 +364,8 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
     # Gates
     utc_hour  = datetime.now(timezone.utc).hour
     blocked   = utc_hour in BLOCKED_UTC_HOURS
-    vol_ok    = gk is None or gk <= 0.002 * 1.4
-    hurst_ok  = hurst is None or hurst >= 0.40
+    vol_ok    = gk is None or gk <= 0.002 * 1.5  # Allow some extra room for volatility spikes (e.g., 0.0035) without rejecting the trade.
+    hurst_ok  = hurst is None or hurst >= 0.45
     markov_ok = has_history and gap >= MARKOV_MIN_GAP and persist >= MIN_PERSIST
     # Informational tag only; entry timing now always uses ENTRY_WINDOW_*.
     is_golden = 65 <= yes_ask <= 73
@@ -443,7 +443,7 @@ def _normalize_order_status(payload: dict) -> tuple[str, int, int]:
         data = data["orders"][0]
 
     raw_status = str(data.get("status") or data.get("order_status") or "").strip().lower()
-    if raw_status in {"filled", "complete", "completed"}:
+    if raw_status in {"filled", "complete", "completed", "executed", "execution_complete"}:
         status = "filled"
     elif raw_status in {"partially_filled", "partial", "partially-filled", "partially filled"}:
         status = "partially_filled"
@@ -460,11 +460,100 @@ def _normalize_order_status(payload: dict) -> tuple[str, int, int]:
         except (TypeError, ValueError):
             return 0
 
-    filled_count = _to_int(data.get("filled_count") if data.get("filled_count") is not None else data.get("filled_quantity"))
-    remaining_count = _to_int(data.get("remaining_count") if data.get("remaining_count") is not None else data.get("remaining_quantity"))
+    filled_count = _to_int(
+        data.get("filled_count")
+        if data.get("filled_count") is not None else
+        data.get("filled_quantity")
+        if data.get("filled_quantity") is not None else
+        data.get("filled")
+        if data.get("filled") is not None else
+        data.get("executed_count")
+        if data.get("executed_count") is not None else
+        data.get("matched_count")
+        if data.get("matched_count") is not None else
+        data.get("count_filled")
+    )
+    remaining_count = _to_int(
+        data.get("remaining_count")
+        if data.get("remaining_count") is not None else
+        data.get("remaining_quantity")
+        if data.get("remaining_quantity") is not None else
+        data.get("remaining")
+        if data.get("remaining") is not None else
+        data.get("count_remaining")
+    )
+
+    # Some Kalshi payloads mark terminal execution via status/remaining only,
+    # while leaving filled_count unset. Infer from known order size fields.
+    total_count = _to_int(
+        data.get("count")
+        if data.get("count") is not None else
+        data.get("order_count")
+        if data.get("order_count") is not None else
+        data.get("quantity")
+        if data.get("quantity") is not None else
+        data.get("initial_count")
+        if data.get("initial_count") is not None else
+        data.get("initial_quantity")
+        if data.get("initial_quantity") is not None else
+        data.get("original_count")
+        if data.get("original_count") is not None else
+        data.get("requested_count")
+    )
+
     if status == "filled" and remaining_count <= 0:
         remaining_count = 0
+        if filled_count <= 0 and total_count > 0:
+            filled_count = total_count
+
+    if status == "partially_filled" and filled_count <= 0 and total_count > 0 and remaining_count >= 0:
+        inferred = total_count - remaining_count
+        if inferred > 0:
+            filled_count = inferred
+
     return status, filled_count, remaining_count
+
+
+def _effective_filled_contracts(order_status: Optional[dict], requested_contracts: int) -> int:
+    """Infer how many contracts were filled from status + counts.
+
+    Kalshi can occasionally report terminal filled states with remaining=0 while
+    leaving filled_count unset; in that case treat it as fully filled.
+    """
+    if not order_status:
+        return 0
+
+    status = str(order_status.get("status") or "").strip().lower()
+
+    try:
+        filled = int(order_status.get("filled_count") or 0)
+    except (TypeError, ValueError):
+        filled = 0
+
+    try:
+        remaining = int(order_status.get("remaining_count") or 0)
+    except (TypeError, ValueError):
+        remaining = 0
+
+    requested_contracts = max(0, int(requested_contracts or 0))
+
+    # Trust explicit fill quantity regardless of label (some payloads use odd status names).
+    if filled > 0:
+        return min(filled, requested_contracts) if requested_contracts > 0 else filled
+
+    if status == "filled":
+        if remaining <= 0 and requested_contracts > 0:
+            return requested_contracts
+
+    if status == "partially_filled":
+        if filled > 0:
+            return min(filled, requested_contracts) if requested_contracts > 0 else filled
+        if requested_contracts > 0 and remaining >= 0:
+            inferred = requested_contracts - remaining
+            if inferred > 0:
+                return inferred
+
+    return 0
 
 
 async def verify_order_status(order_id: str) -> dict:
@@ -784,7 +873,7 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
                 order_status = None
                 for _ in range(3):
                     order_status = await verify_order_status(order_id)
-                    if order_status["status"] in {"filled", "partially_filled"} and order_status["filled_count"] > 0:
+                    if _effective_filled_contracts(order_status, contracts) > 0:
                         break
                     await asyncio.sleep(2)
 
@@ -792,8 +881,11 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
                     status = order_status["status"]
                     filled_count = order_status["filled_count"]
                     remaining_count = order_status["remaining_count"]
+                    inferred_filled = _effective_filled_contracts(order_status, contracts)
                     log.info(
-                        f"ORDER STATUS — id={order_id} status={status} filled={filled_count}/{contracts} remaining={remaining_count}"
+                        f"ORDER STATUS — id={order_id} status={status} "
+                        f"filled={filled_count}/{contracts} inferred_filled={inferred_filled}/{contracts} "
+                        f"remaining={remaining_count}"
                     )
             except httpx.HTTPStatusError as e:
                 log.error(f"Kalshi API error {e.response.status_code}: {e.response.text}")
@@ -808,38 +900,66 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
 
         # If IOC did not fill, keep the same window alive and retry while time remains.
         if not dry_run:
-            filled_now = bool(
-                order_status
-                and order_status["status"] in {"filled", "partially_filled"}
-                and order_status["filled_count"] > 0
-            )
+            filled_contracts_now = _effective_filled_contracts(order_status, contracts)
+            filled_now = filled_contracts_now > 0
             if not filled_now:
                 status = order_status["status"] if order_status else "unknown"
                 fill_info = f"status={status}"
                 if order_status:
+                    inferred_filled = _effective_filled_contracts(order_status, contracts)
                     fill_info = (
                         f"status={status} filled={order_status['filled_count']}/{contracts} "
+                        f"inferred_filled={inferred_filled}/{contracts} "
                         f"remaining={order_status['remaining_count']}"
                     )
                 mins_left_now = max(0.0, (close_dt - datetime.now(timezone.utc)).total_seconds() / 60)
                 log.warning(f"Order {order_id} not filled ({fill_info})")
 
-                if should_retry_window(mins_left_now, [fill_info]):
-                    delay_s = retry_delay_for_window(mins_left_now)
-                    log.info(f"Unfilled order — re-evaluating window in {delay_s:.0f}s...")
-                    await asyncio.sleep(delay_s)
-                else:
-                    session.traded.add(window_id)
-                    wait_s = max(5, (mins_left_now + 0.75) * 60)
-                    log.info(f"Window nearly closed after unfilled order — waiting {fmt(wait_s)} for close...")
-                    await asyncio.sleep(wait_s)
-                continue
+                # Safety first: avoid duplicate exposure when IOC comes back as terminal-canceled
+                # with zero remaining but without a trustworthy fill count.
+                if order_status and status == "canceled" and order_status.get("remaining_count", 0) == 0:
+                    log.warning(
+                        "Ambiguous terminal cancel (remaining=0) — rechecking order status before retry"
+                    )
+
+                    # Kalshi can briefly lag on fill fields; do a short recheck cycle before deciding.
+                    for _ in range(3):
+                        await asyncio.sleep(2)
+                        latest_status = await verify_order_status(order_id)
+                        if not latest_status:
+                            continue
+                        order_status = latest_status
+                        if _effective_filled_contracts(order_status, contracts) > 0:
+                            filled_now = True
+                            log.info(
+                                f"ORDER STATUS RECHECK — id={order_id} status={order_status['status']} "
+                                f"filled={order_status['filled_count']}/{contracts} "
+                                f"inferred_filled={_effective_filled_contracts(order_status, contracts)}/{contracts} "
+                                f"remaining={order_status['remaining_count']}"
+                            )
+                            break
+
+                if not filled_now:
+                    if should_retry_window(mins_left_now, [fill_info]):
+                        delay_s = retry_delay_for_window(mins_left_now)
+                        log.info(f"Unfilled order — re-evaluating window in {delay_s:.0f}s...")
+                        await asyncio.sleep(delay_s)
+                    else:
+                        session.traded.add(window_id)
+                        wait_s = max(5, (mins_left_now + 0.75) * 60)
+                        log.info(f"Window nearly closed after unfilled order — waiting {fmt(wait_s)} for close...")
+                        await asyncio.sleep(wait_s)
+                    continue
 
         session.traded.add(window_id)
 
         # Queue for settlement check only when the order actually filled.
-        if not dry_run and order_status and order_status["status"] in {"filled", "partially_filled"} and order_status["filled_count"] > 0:
-            filled_contracts = max(1, int(order_status["filled_count"]))
+        if not dry_run:
+            filled_contracts = _effective_filled_contracts(order_status, contracts)
+        else:
+            filled_contracts = 0
+
+        if not dry_run and filled_contracts > 0:
 
             # Mirror web UI behavior: rest a 99-cent take-profit order for filled contracts.
             sell_res = await place_limit_sell_order(ticker=ticker, side=rec.lower(), contracts=filled_contracts)
