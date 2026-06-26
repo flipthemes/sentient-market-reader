@@ -79,10 +79,14 @@ sentient-trader-mcp/*.egg-info/
 python-service/backtest_67c.py
 python-service/test_tiered_kelly.py
 .vs/slnx.sqlite
-.vs/
-.vs
+.vs/**
 
 python-service/tests/test_trade_daemon_order_status.py
 python-service/research/2026-06-24 - Copy.md
 python-service/research/2026-06-24.md
 python-service/__pycache__/main.cpython-313.pyc
+python-service/tests/test_run_backtest_logging_import.py
+python-service/research/2026-06-22-min4max9.md
+python-service/research/2026-06-25-14day.md
+python-service/research/2026-06-25-full.md
+python-service/research/2026-06-25.md

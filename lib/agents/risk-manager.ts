@@ -34,11 +34,11 @@ const RISK_PARAMS = {
   maxGivebackMult:   1.5,  // stop if daily P&L drops > 1.5× maxDailyLoss from session peak
   maxTradesPerDay:  48,    // caps at one per 15-min window
   minEdgePct:        0,    // disabled
-  minMinutesLeft:    4,    // skip if < (3)6 min left — 6-9min = 98.3% WR vs 3-6min = 91.7% WR on live fills ##default 6 minutes##
+  minMinutesLeft:    3,    // skip if < (3)6 min left — 6-9min = 98.3% WR vs 3-6min = 91.7% WR on live fills ##default 6 minutes##
   maxMinutesLeft:    9,    // live fills: 9-12min window is 69.5% wr (signal not settled)
   minDistancePct:   0.04,  // skip near-ATM trades — backtest: 0.05 gives 336 trades @76.8% WR vs 0.10 gives 173 @85% (more volume, better absolute return)
   minEntryPrice:     0,    // no floor — 62¢ and 71¢ zones both profitable
-  maxEntryPriceYes: 72,    // ¢ — YES: live data shows YES 55-72¢ all +EV; YES 72¢+ = -$9.34/trade **I CHANGED IT TO +2**
+  maxEntryPriceYes: 72,    // ¢ — YES: live data shows YES 55-72¢ all +EV; YES 72¢+ = -$9.34/trade 
   maxEntryPriceNo:  68,    // ¢ — NO cap lower: NO 65-72¢ = -$7.71/trade (53% WR vs 69% needed). Above 65¢ NO is consensus-following with bad payout. **I CHANGED IT TO +2**
   maxTradePct:      15,    // % of portfolio per trade
 }

@@ -53,7 +53,7 @@ export default function AgentStatsPanel({ stats, allowance, initialAllowance, ka
         <div style={{ marginBottom: 12 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
             <span style={{ fontSize: 9, color: 'var(--text-muted)', fontWeight: 600 }}>
-              Win rate · {stats.wins}W / {stats.losses}L
+              Win rate · {stats.wins}W / {stats.losses}L / {stats.failed}F
             </span>
             <span style={{ fontSize: 10, fontFamily: 'var(--font-geist-mono)', fontWeight: 800, color: winRate >= 80 ? 'var(--green)' : winRate >= 60 ? 'var(--amber)' : 'var(--red)' }}>
               {winRate.toFixed(0)}%
@@ -76,6 +76,7 @@ export default function AgentStatsPanel({ stats, allowance, initialAllowance, ka
           ['Windows',      stats.windowsTraded > 0 ? String(stats.windowsTraded) : '—', undefined],
           ['Bets placed',  stats.totalSlices   > 0 ? String(stats.totalSlices)   : '—', undefined],
           ['Deployed',     stats.totalDeployed > 0 ? `$${stats.totalDeployed.toFixed(2)}` : '—', undefined],
+          ['Failed placements', stats.failed > 0 ? String(stats.failed) : '0', stats.failed > 0 ? 'var(--red)' : undefined],
           ['Best window',  hasTrades ? `${stats.bestWindow  >= 0 ? '+' : ''}$${stats.bestWindow.toFixed(2)}`  : '—',
             stats.bestWindow  > 0 ? 'var(--green)' : undefined],
           ['Worst window', hasTrades ? `${stats.worstWindow >= 0 ? '+' : ''}$${stats.worstWindow.toFixed(2)}` : '—',

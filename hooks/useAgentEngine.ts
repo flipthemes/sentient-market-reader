@@ -33,7 +33,7 @@ const DEFAULT_STATE: AgentStateSnapshot = {
   trades:           [],
   stats: {
     windowsTraded: 0, totalSlices: 0, totalDeployed: 0, totalPnl: 0,
-    wins: 0, losses: 0, winRate: 0, bestWindow: 0, worstWindow: 0,
+    wins: 0, losses: 0, failed: 0, winRate: 0, bestWindow: 0, worstWindow: 0,
   },
   pipeline: null,
   strikePrice: 0,

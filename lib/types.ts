@@ -434,7 +434,7 @@ export interface AgentTrade {
   btcPriceAtEntry?: number
   expiresAt: string
   enteredAt: string
-  status: 'open' | 'won' | 'lost'
+  status: 'open' | 'won' | 'lost' | 'failed'
   pnl?: number            // profit/loss in dollars (net of cost)
   settlementPrice?: number
   pModel: number
@@ -453,6 +453,7 @@ export interface AgentStats {
   totalPnl: number
   wins: number
   losses: number
+  failed: number
   winRate: number
   bestWindow: number
   worstWindow: number

@@ -97,9 +97,11 @@ export default function AgentTradeLog({ trades, onClearHistory }: { trades: Agen
             const windowTrades = trades.filter(t => t.windowKey === wk).sort((a, b) => a.sliceNum - b.sliceNum)
             const totalCost    = windowTrades.reduce((s, t) => s + t.cost, 0)
             const totalPnl     = windowTrades.reduce((s, t) => s + (t.pnl ?? 0), 0)
-            const anyOpen      = windowTrades.some(t => t.status === 'open')
-            const allWon       = !anyOpen && windowTrades.every(t => t.status === 'won')
-            const anyLost      = windowTrades.some(t => t.status === 'lost')
+            const isFailedTrade = (t: AgentTrade) => t.status === 'failed' || (!!t.orderError && !t.liveOrderId)
+            const anyOpen       = windowTrades.some(t => t.status === 'open')
+            const allWon        = !anyOpen && windowTrades.every(t => t.status === 'won')
+            const anyLost       = windowTrades.some(t => t.status === 'lost' && !isFailedTrade(t))
+            const anyFailed     = windowTrades.some(t => isFailedTrade(t))
             const side         = windowTrades[0]?.side
 
             return (
@@ -118,10 +120,18 @@ export default function AgentTradeLog({ trades, onClearHistory }: { trades: Agen
                   </span>
                   <span style={{
                     fontSize: 10, fontWeight: 700,
-                    color: anyOpen ? 'var(--text-muted)' : allWon ? 'var(--green-dark)' : anyLost ? 'var(--pink-dark)' : 'var(--text-muted)',
+                    color: anyOpen
+                      ? 'var(--text-muted)'
+                      : allWon
+                        ? 'var(--green-dark)'
+                        : anyLost
+                          ? 'var(--pink-dark)'
+                          : anyFailed
+                            ? 'var(--red)'
+                            : 'var(--text-muted)',
                     animation: 'scaleIn 0.25s cubic-bezier(0.34,1.56,0.64,1)',
                   }}>
-                    {anyOpen ? 'Open' : allWon ? 'Win' : anyLost ? 'Loss' : '—'}
+                    {anyOpen ? 'Open' : allWon ? 'Win' : anyLost ? 'Loss' : anyFailed ? 'Failed' : '—'}
                   </span>
                   {!anyOpen && totalPnl !== 0 && (
                     <span style={{

@@ -91,6 +91,17 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
                     "wr":     round(len(bw)/len(bt_)*100, 1),
                     "pnl":    round(sum(r["pnl"] for r in bt_), 2),
                 }
+        time_buckets = {}
+        # Keep windows adjacent and non-overlapping: [6,9) and [3,6)
+        for lo, hi, label in [(6, 9, "9-6m"), (3, 6, "6-3m")]:
+            bt_ = [r for r in executed if lo <= (r.get("minutes_left") or 0) < hi]
+            bw  = [r for r in bt_ if r.get("outcome_sim", r["outcome"]) == "WIN"]
+            if bt_:
+                time_buckets[label] = {
+                    "trades": len(bt_),
+                    "wr":     round(len(bw)/len(bt_)*100, 1),
+                    "pnl":    round(sum(r["pnl"] for r in bt_), 2),
+                }
         return {
             "days_back":         days,
             "sizing_mode":       _bt.SIZING_MODE,
@@ -105,6 +116,7 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
             "total_wins":        len(wins),
             "total_losses":      len(losses),
             "price_buckets":     buckets,
+            "time_buckets":      time_buckets,
             "params":            dict(overrides),
         }
     finally:
@@ -242,6 +254,36 @@ def _bucket_stats(trades, lo, hi):
         "wr":     round(len(bw)/len(bt)*100, 1),
         "pnl":    round(sum(t["pnl"] for t in bt), 2),
     }
+
+
+def _append_bucket_section(lines: list[str], title: str, buckets: dict) -> None:
+    lines += ["", f"**{title}:**", ""]
+    if not buckets:
+        lines.append("- No data in this sample")
+        return
+    for bucket, bdata in buckets.items():
+        lines.append(f"- `{bucket}`: {bdata['trades']} trades, {bdata['wr']:.1f}% WR, P&L ${bdata['pnl']:+.2f}")
+
+
+def _current_settings() -> dict:
+    """Snapshot the key run_backtest settings used for this research run."""
+    settings = {
+        "MARKOV_MIN_GAP": _bt.MARKOV_MIN_GAP,
+        "MIN_PERSIST": _bt.MIN_PERSIST,
+        "MAX_ENTRY_PRICE_YES": _bt.MAX_ENTRY_PRICE_YES,
+        "MAX_ENTRY_PRICE_NO": _bt.MAX_ENTRY_PRICE_NO,
+        "MIN_MINUTES_LEFT": _bt.MIN_MINUTES_LEFT,
+        "MAX_MINUTES_LEFT": _bt.MAX_MINUTES_LEFT,
+        "MAX_VOL_MULT": _bt.MAX_VOL_MULT,
+        "MIN_HURST": _bt.MIN_HURST,
+        "BLOCKED_UTC_HOURS": sorted(_bt.BLOCKED_UTC_HOURS),
+        "SIZING_MODE": _bt.SIZING_MODE,
+        "ALLOWANCE_PCT": round(_bt.KELLY_FRACTION * 100, 2),
+        "KELLY_FRACTION": _bt.KELLY_FRACTION,
+    }
+    if hasattr(_bt, "MAX_ENTRY_PRICE_RM"):
+        settings["MAX_ENTRY_PRICE_RM"] = _bt.MAX_ENTRY_PRICE_RM
+    return settings
 
 
 # ── Claude analysis ────────────────────────────────────────────────────────────
@@ -473,10 +515,21 @@ def main():
         print("  Done.\n")
 
     # ── Step 6: Write report ──────────────────────────────────────────────────
+    current_settings = _current_settings()
     lines = [
         f"# Sentient Research Report — {datetime.now().strftime('%Y-%m-%d')}",
         f"",
         f"**Backtest:** {args.days} days | **Baseline score:** {b_score:.1f}",
+        f"",
+        f"## Current Settings",
+        f"",
+        f"| Parameter | Value |",
+        f"|-----------|-------|",
+    ]
+    for key, val in current_settings.items():
+        lines.append(f"| `{key}` | `{val}` |")
+
+    lines += [
         f"",
         f"## Baseline ({args.days}d)",
         f"",
@@ -491,8 +544,9 @@ def main():
         f"**Price buckets:**",
         f"",
     ]
-    for bucket, bdata in baseline.get("price_buckets", {}).items():
-        lines.append(f"- `{bucket}`: {bdata['trades']} trades, {bdata['wr']:.1f}% WR, P&L ${bdata['pnl']:+.2f}")
+
+    _append_bucket_section(lines, "Price buckets", baseline.get("price_buckets", {}))
+    _append_bucket_section(lines, "Time buckets", baseline.get("time_buckets", {}))
 
     if live_stats.get("available"):
         lines += [

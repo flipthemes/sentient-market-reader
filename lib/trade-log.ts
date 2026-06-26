@@ -41,7 +41,14 @@ function ensureDir() {
 export function readTradeLog(): AgentTrade[] {
   try {
     if (!existsSync(LOG_PATH)) return []
-    return JSON.parse(readFileSync(LOG_PATH, 'utf-8')) as AgentTrade[]
+    const parsed = JSON.parse(readFileSync(LOG_PATH, 'utf-8')) as AgentTrade[]
+    return parsed.map((t) => {
+      // Back-compat: older builds stored placement failures as "lost".
+      if (t.status === 'lost' && t.orderError && !t.liveOrderId) {
+        return { ...t, status: 'failed', pnl: undefined }
+      }
+      return t
+    })
   } catch { return [] }
 }
 

@@ -26,7 +26,6 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -45,12 +44,11 @@ D_THRESHOLD          = 0.0
 D_MAX_THRESHOLD      = 99.0
 
 # Timing
-MIN_MINUTES_LEFT     = 4
+MIN_MINUTES_LEFT     = 3
 MAX_MINUTES_LEFT     = 9
 
 # Hurst
-MIN_HURST            = 0.50
-
+MIN_HURST            = 0.40            # 0.45 my setting 0.50 default
 # Velocity gate
 VEL_SAFETY_RATIO     = 0.40
 
@@ -59,7 +57,7 @@ MARKOV_MIN_GAP       = 0.11
 MIN_PERSIST          = 0.82
 
 # Vol regime
-MAX_VOL_MULT         = 20
+MAX_VOL_MULT         = 1.4
 
 # UI-aligned allowance sizing.
 # Use a fixed allowance equal to a configured fraction of current bankroll,
@@ -85,7 +83,7 @@ MAX_TRADES_PER_DAY   = 48
 MAX_DAILY_LOSS_PCT   = 25
 MAX_DAILY_LOSS_FLOOR = 0
 MAX_DAILY_LOSS_CAP   = 500
-MAX_GIVEBACK_MULT    = 1.5
+MAX_GIVEBACK_MULT    = 1.4
 POLLER_INTERVAL_MIN  = 0.5
 BLOCKED_UTC_HOURS    = {8, 11, 16, 18, 21}  # live data: 8=44%WR, 16=36%WR, 21=40%WR (147 fills Apr 19-22)
 
@@ -747,6 +745,10 @@ def print_compare_summary(allowance_summary: dict, legacy_summary: dict) -> None
 
 def main():
     global KELLY_FRACTION, SIZING_MODE
+
+    # Configure console logging only for direct CLI execution.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
     parser = argparse.ArgumentParser(description="KXBTC15M sizing backtest")
     parser.add_argument("--allowance-pct", type=float, default=20.0,

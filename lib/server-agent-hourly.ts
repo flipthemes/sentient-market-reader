@@ -157,6 +157,8 @@ function selectBestStrike(markets: KalshiMarket[], btcPrice: number): KalshiMark
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 function computeStats(trades: AgentTrade[]): AgentStats {
+  const failedTrade = (t: AgentTrade) => t.status === 'failed' || (!!t.orderError && !t.liveOrderId)
+  const failed      = trades.filter(failedTrade)
   const confirmed  = trades.filter(t => t.liveOrderId)
   const settled    = confirmed.filter(t => t.status !== 'open')
   const wins       = settled.filter(t => t.status === 'won')
@@ -171,6 +173,7 @@ function computeStats(trades: AgentTrade[]): AgentStats {
     totalPnl:      settled.reduce((s, t) => s + (t.pnl ?? 0), 0),
     wins:          wins.length,
     losses:        settled.length - wins.length,
+    failed:        failed.length,
     winRate:       settled.length > 0 ? wins.length / settled.length : 0,
     bestWindow:    windowPnls.length ? Math.max(...windowPnls) : 0,
     worstWindow:   windowPnls.length ? Math.min(...windowPnls) : 0,
@@ -782,8 +785,8 @@ class HourlyServerAgent extends EventEmitter {
         btcPriceAtEntry: btcPrice,
         expiresAt:       md.activeMarket.close_time,
         enteredAt:       new Date().toISOString(),
-        status:          liveOrderId ? 'open' : 'lost',
-        pnl:             liveOrderId ? undefined : 0,
+        status:          liveOrderId ? 'open' : 'failed',
+        pnl:             undefined,
         pModel:          prob.pModel,
         pMarket:         prob.pMarket,
         edge:            prob.edge,

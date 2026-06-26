@@ -52,6 +52,7 @@ DAEMON_MAX_TRADE_PCT = 0.35
 DAEMON_MAX_CONTRACTS = 50
 ENTRY_WINDOW_MINUTES_LEFT = float(MIN_MINUTES_LEFT)
 ENTRY_WINDOW_MAX_MINUTES_LEFT = float(MAX_MINUTES_LEFT)
+TAKE_PROFIT_LIMIT_SELL_CENTS = 99
 
 # ── Logging ─────────────────────────────────────────────────────────────[...]
 _log_dir = Path(__file__).parent / "logs"
@@ -59,14 +60,25 @@ _log_dir.mkdir(exist_ok=True)
 
 def _make_logger() -> logging.Logger:
     logger = logging.getLogger("daemon")
+    # Avoid duplicate output when imported modules configure root logging.
+    # Also make this setup idempotent if the module is reloaded.
+    if getattr(logger, "_sentient_configured", False):
+        return logger
+
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     fmt = logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S UTC")
+
+    if logger.handlers:
+        logger.handlers.clear()
+
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     fh = logging.FileHandler(_log_dir / f"daemon_{datetime.now().strftime('%Y%m%d')}.log")
     fh.setFormatter(fmt)
     logger.addHandler(sh)
     logger.addHandler(fh)
+    logger._sentient_configured = True
     return logger
 
 log = _make_logger()
@@ -125,6 +137,18 @@ async def _kpost(endpoint: str, body: dict) -> dict:
         r = await c.post(_api_url(endpoint), json=body, headers=_build_headers("POST", endpoint))
         r.raise_for_status()
         return r.json()
+
+
+async def _kdelete(endpoint: str) -> dict:
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.delete(_api_url(endpoint), headers=_build_headers("DELETE", endpoint))
+        r.raise_for_status()
+        if not r.content:
+            return {}
+        try:
+            return r.json()
+        except Exception:
+            return {}
 
 
 def _norm_market(m: dict) -> dict:
@@ -340,8 +364,8 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
     # Gates
     utc_hour  = datetime.now(timezone.utc).hour
     blocked   = utc_hour in BLOCKED_UTC_HOURS
-    vol_ok    = gk is None or gk <= 0.002 * 1.25
-    hurst_ok  = hurst is None or hurst >= 0.50
+    vol_ok    = gk is None or gk <= 0.002 * 1.4
+    hurst_ok  = hurst is None or hurst >= 0.40
     markov_ok = has_history and gap >= MARKOV_MIN_GAP and persist >= MIN_PERSIST
     # Informational tag only; entry timing now always uses ENTRY_WINDOW_*.
     is_golden = 65 <= yes_ask <= 73
@@ -485,6 +509,78 @@ async def verify_order_status(order_id: str) -> dict:
         "remaining_count": remaining_count,
         "raw": payload,
     }
+
+
+async def place_limit_sell_order(ticker: str, side: str, contracts: int) -> dict:
+    """Place a resting 99-cent GTC sell order to take profit on filled contracts."""
+    if contracts <= 0:
+        return {"ok": False, "error": "contracts must be > 0"}
+
+    expected_sell_side, _ = _v2_book(side, "sell", TAKE_PROFIT_LIMIT_SELL_CENTS)
+
+    # Cancel older resting sell orders on the same market/leg to avoid duplicate ladders.
+    canceled_ids: list[str] = []
+    cancel_errors: list[str] = []
+    try:
+        payload = await _kget("/portfolio/orders", {"limit": 200})
+        orders = payload.get("orders", []) if isinstance(payload, dict) else []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("ticker") or "") != ticker:
+                continue
+
+            status = str(order.get("status") or order.get("order_status") or "").strip().lower()
+            if status not in {"resting", "open", "pending", "new", "accepted", "submitted", "queued"}:
+                continue
+
+            action = str(order.get("action") or "").strip().lower()
+            if action and action != "sell":
+                continue
+
+            existing_side = str(order.get("side") or "").strip().lower()
+            if existing_side and existing_side != expected_sell_side:
+                continue
+
+            order_id = str(order.get("order_id") or order.get("id") or "").strip()
+            if not order_id:
+                continue
+
+            try:
+                await _kdelete(f"/portfolio/events/orders/{quote(order_id, safe='')}")
+                canceled_ids.append(order_id)
+            except Exception as cancel_exc:
+                cancel_errors.append(f"{order_id}: {cancel_exc}")
+    except Exception as scan_exc:
+        cancel_errors.append(f"scan: {scan_exc}")
+
+    v2_side, price = _v2_book(side, "sell", TAKE_PROFIT_LIMIT_SELL_CENTS)
+    body = {
+        "ticker":                     ticker,
+        "client_order_id":            str(uuid.uuid4()),
+        "side":                       v2_side,
+        "count":                      f"{contracts:.2f}",
+        "price":                      price,
+        "time_in_force":              "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
+    }
+
+    try:
+        result = await _kpost("/portfolio/events/orders", body)
+        return {
+            "ok": True,
+            "order_id": result.get("order_id") or "unknown",
+            "canceled_order_ids": canceled_ids,
+            "cancel_errors": cancel_errors,
+            "raw": result,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "canceled_order_ids": canceled_ids,
+            "cancel_errors": cancel_errors,
+        }
 
 
 async def get_live_bankroll() -> Optional[float]:
@@ -663,6 +759,7 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
             f"ticker={ticker}"
         )
 
+        order_status = None
         if dry_run:
             order_id = "dry-run"
             log.info(f"[DRY RUN] Order simulated — no real order sent")
@@ -709,11 +806,59 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
                 await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
                 continue
 
+        # If IOC did not fill, keep the same window alive and retry while time remains.
+        if not dry_run:
+            filled_now = bool(
+                order_status
+                and order_status["status"] in {"filled", "partially_filled"}
+                and order_status["filled_count"] > 0
+            )
+            if not filled_now:
+                status = order_status["status"] if order_status else "unknown"
+                fill_info = f"status={status}"
+                if order_status:
+                    fill_info = (
+                        f"status={status} filled={order_status['filled_count']}/{contracts} "
+                        f"remaining={order_status['remaining_count']}"
+                    )
+                mins_left_now = max(0.0, (close_dt - datetime.now(timezone.utc)).total_seconds() / 60)
+                log.warning(f"Order {order_id} not filled ({fill_info})")
+
+                if should_retry_window(mins_left_now, [fill_info]):
+                    delay_s = retry_delay_for_window(mins_left_now)
+                    log.info(f"Unfilled order — re-evaluating window in {delay_s:.0f}s...")
+                    await asyncio.sleep(delay_s)
+                else:
+                    session.traded.add(window_id)
+                    wait_s = max(5, (mins_left_now + 0.75) * 60)
+                    log.info(f"Window nearly closed after unfilled order — waiting {fmt(wait_s)} for close...")
+                    await asyncio.sleep(wait_s)
+                continue
+
         session.traded.add(window_id)
 
         # Queue for settlement check only when the order actually filled.
         if not dry_run and order_status and order_status["status"] in {"filled", "partially_filled"} and order_status["filled_count"] > 0:
             filled_contracts = max(1, int(order_status["filled_count"]))
+
+            # Mirror web UI behavior: rest a 99-cent take-profit order for filled contracts.
+            sell_res = await place_limit_sell_order(ticker=ticker, side=rec.lower(), contracts=filled_contracts)
+            if sell_res.get("ok"):
+                canceled_cnt = len(sell_res.get("canceled_order_ids") or [])
+                log.info(
+                    f"LIMIT-SELL PLACED — id={sell_res.get('order_id')} side={rec} "
+                    f"count={filled_contracts} @ {TAKE_PROFIT_LIMIT_SELL_CENTS}¢ GTC"
+                )
+                if canceled_cnt:
+                    log.info(f"LIMIT-SELL REPLACED — canceled {canceled_cnt} prior resting sell order(s) on {ticker}")
+            else:
+                log.warning(
+                    f"LIMIT-SELL FAILED — side={rec} count={filled_contracts} "
+                    f"@ {TAKE_PROFIT_LIMIT_SELL_CENTS}¢ GTC | {sell_res.get('error', 'unknown error')}"
+                )
+            if sell_res.get("cancel_errors"):
+                log.warning(f"LIMIT-SELL CANCEL WARNINGS — {' | '.join(sell_res.get('cancel_errors'))}")
+
             session.pending[window_id] = {
                 "ticker":      ticker,
                 "side":        rec,

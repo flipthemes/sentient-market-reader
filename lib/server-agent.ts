@@ -35,7 +35,7 @@ const MIN_MINUTES_LEFT       = 2         // safety floor: don't trade with < 2 m
 const POST_WINDOW_BUFFER_MS  = 5_000
 const MIN_FAST_ENTRY_PRICE     = 55   // ¢ — matches risk manager floor
 const MAX_FAST_ENTRY_PRICE_YES = 72   // ¢ — YES: all buckets ≤72¢ are +EV in live data
-const MAX_FAST_ENTRY_PRICE_NO  = 65   // ¢ — NO: 65¢+ is -EV (consensus-following, bad payout ratio)
+const MAX_FAST_ENTRY_PRICE_NO  = 68   // ¢ — NO: 65¢+ is -EV (consensus-following, bad payout ratio)
 
 // Kalshi maker fee: ceil(0.0175 × C × P × (1-P)) — agent places resting limit orders
 const MAKER_FEE_RATE = 0.0175
@@ -76,6 +76,8 @@ function getDelayMs(): { delayMs: number; closeMs: number; minutesLeft: number }
 }
 
 function computeStats(trades: AgentTrade[]): AgentStats {
+  const failedTrade = (t: AgentTrade) => t.status === 'failed' || (!!t.orderError && !t.liveOrderId)
+  const failed      = trades.filter(failedTrade)
   const confirmed   = trades.filter(t => t.liveOrderId)
   const settled     = confirmed.filter(t => t.status !== 'open')
   const wins        = settled.filter(t => t.status === 'won')
@@ -90,6 +92,7 @@ function computeStats(trades: AgentTrade[]): AgentStats {
     totalPnl:       settled.reduce((s, t) => s + (t.pnl ?? 0), 0),
     wins:           wins.length,
     losses:         settled.length - wins.length,
+    failed:         failed.length,
     winRate:        settled.length > 0 ? wins.length / settled.length : 0,
     bestWindow:     windowPnls.length ? Math.max(...windowPnls) : 0,
     worstWindow:    windowPnls.length ? Math.min(...windowPnls) : 0,
@@ -1018,8 +1021,8 @@ class ServerAgent extends EventEmitter {
         btcPriceAtEntry:  pf.currentPrice,
         expiresAt:        md.activeMarket.close_time,
         enteredAt:        new Date().toISOString(),
-        status:           liveOrderId ? 'open' : 'lost',
-        pnl:              liveOrderId ? undefined : 0,
+        status:           liveOrderId ? 'open' : 'failed',
+        pnl:              undefined,
         pModel:           prob.pModel,
         pMarket:          prob.pMarket,
         edge:             prob.edge,
