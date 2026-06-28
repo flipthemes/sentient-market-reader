@@ -12,7 +12,7 @@ Usage:
   python3 trade_daemon.py --bankroll 500
 """
 
-import argparse, asyncio, base64, json, logging, math, os, sys, time, uuid
+import argparse, asyncio, base64, json, logging, math, os, re, sys, time, uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -24,39 +24,119 @@ sys.path.insert(0, os.path.dirname(__file__))
 from run_backtest import (
     fetch_candles_5m, fetch_candles_15m,
     build_markov_history, build_transition_matrix, predict_from_momentum,
-    price_change_to_state, gk_vol, compute_hurst,
-    MARKOV_MIN_GAP, MIN_PERSIST, KELLY_FRACTION, MAX_TRADE_PCT,
+    price_change_to_state, gk_vol, compute_efficiency_ratio,
+    MARKOV_MIN_GAP, MIN_PERSIST, MIN_HISTORY,
+    KELLY_FRACTION, MAX_TRADE_PCT,
+    MIN_EFFICIENCY_RATIO, ER_PERIOD, MAX_VOL_MULT, REF_VOL_15M, MIN_DIST_PCT,
     MIN_MINUTES_LEFT, MAX_MINUTES_LEFT,
     MAX_ENTRY_PRICE_RM, MAX_ENTRY_PRICE_YES, MAX_ENTRY_PRICE_NO,
+    DAEMON_MAX_TRADE_PCT, DAEMON_MAX_CONTRACTS, LT65_MIN_GAP,
     MAKER_FEE_RATE, EMPIRICAL_PRICE_BY_D, BLOCKED_UTC_HOURS,
     allowance_contracts,
 )
-
-# ── Env / config ────────────────────────────────────────────────────────────[...]
-_env_path = Path(__file__).parent.parent / ".env.local"
-if _env_path.exists():
-    for line in _env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
 
 KALSHI_HOST    = "https://api.elections.kalshi.com"
 API_PREFIX     = "/trade-api/v2"
 KALSHI_API_KEY = os.environ.get("KALSHI_API_KEY", "")
 KALSHI_PEM     = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private.pem")
 
-MAX_DAILY_LOSS      = 50.0   # $ hard stop for the day
-MAX_GIVEBACK_X      = 1.5    # stop if peak P&L drops by this × MAX_DAILY_LOSS
-MAX_DAILY_TRADES    = 48
-DAEMON_MAX_TRADE_PCT = 0.35
-DAEMON_MAX_CONTRACTS = 50
+MAX_DAILY_LOSS       = float(os.environ.get("DAEMON_MAX_DAILY_LOSS", "50.0"))
+MAX_GIVEBACK_X       = float(os.environ.get("DAEMON_MAX_GIVEBACK_X", "1.5"))
+MAX_DAILY_TRADES     = int(float(os.environ.get("DAEMON_MAX_DAILY_TRADES", "48")))
 ENTRY_WINDOW_MINUTES_LEFT = float(MIN_MINUTES_LEFT)
 ENTRY_WINDOW_MAX_MINUTES_LEFT = float(MAX_MINUTES_LEFT)
 TAKE_PROFIT_LIMIT_SELL_CENTS = 99
+SECOND_CHANCE_RETRY_CENTS = max(0, int(float(os.environ.get("DAEMON_SECOND_CHANCE_RETRY_CENTS", "2"))))
+INITIAL_IOC_USE_CAP = str(os.environ.get("DAEMON_INITIAL_IOC_USE_CAP", "0")).strip().lower() in {"1", "true", "yes", "on"}
+INITIAL_IOC_MAX_LIFT_CENTS = max(0, int(float(os.environ.get("DAEMON_INITIAL_IOC_MAX_LIFT_CENTS", "6"))))
+INITIAL_IOC_PAD_CENTS = max(0, int(float(os.environ.get("DAEMON_INITIAL_IOC_PAD_CENTS", "0"))))
+INITIAL_IOC_PAD_LT65_EXTRA_CENTS = max(0, int(float(os.environ.get("DAEMON_INITIAL_IOC_PAD_LT65_EXTRA_CENTS", "0"))))
 
 # ── Logging ─────────────────────────────────────────────────────────────[...]
 _log_dir = Path(__file__).parent / "logs"
 _log_dir.mkdir(exist_ok=True)
+
+
+class _Ansi:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    LIGHT_GREEN = "\033[92m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
+
+def _supports_color(stream) -> bool:
+    # Respect explicit opt-out first.
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def _colorize_message(msg: str, enabled: bool) -> str:
+    if not enabled or not msg:
+        return msg
+
+    # Highlight high-signal tokens while leaving numeric/details intact.
+    patterns = [
+        (r"\bTRADE\b", _Ansi.BOLD + _Ansi.CYAN),
+        (r"\bNO TRADE\b", _Ansi.BOLD + _Ansi.YELLOW),
+        (r"\bORDER PLACED\b", _Ansi.BOLD + _Ansi.CYAN),
+        (r"\bORDER STATUS(?: RECHECK)?\b", _Ansi.BOLD + _Ansi.BLUE),
+        (r"\bLIMIT-SELL PLACED\b", _Ansi.BOLD + _Ansi.GREEN),
+        (r"\bLIMIT-SELL FAILED\b", _Ansi.BOLD + _Ansi.RED),
+        (r"\bSETTLED WIN \+\$", _Ansi.BOLD + _Ansi.GREEN),
+        (r"\bSETTLED LOSS -\$", _Ansi.BOLD + _Ansi.RED),
+        (r"\bSESSION PAUSED\b", _Ansi.BOLD + _Ansi.RED),
+        (r"\bWARNING\b", _Ansi.BOLD + _Ansi.YELLOW),
+        (r"\bERROR\b", _Ansi.BOLD + _Ansi.RED),
+        (r"\bYES\b", _Ansi.LIGHT_GREEN),
+        (r"\bNO\b", _Ansi.RED),
+        (r"\bhigh\s+vol(?:\s*\(vol\))?\b", _Ansi.BOLD + _Ansi.YELLOW),
+        (r"\bhigh\s+volatilit(?:y|ies)\b", _Ansi.BOLD + _Ansi.YELLOW),
+        (r"\bhigh\s+volitilit(?:y|ies)\b", _Ansi.BOLD + _Ansi.YELLOW),
+        (r"\bmean-reverting\b", _Ansi.MAGENTA),
+        (r"\bER\s*[<>=]+\s*-?\d+(?:\.\d+)?", _Ansi.BOLD + _Ansi.MAGENTA),
+        (r"\[DRY RUN\]", _Ansi.MAGENTA),
+    ]
+
+    out = msg
+    for pat, color in patterns:
+        out = re.sub(pat, lambda m: f"{color}{m.group(0)}{_Ansi.RESET}", out)
+    return out
+
+
+class ColorFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG: _Ansi.DIM + _Ansi.CYAN,
+        logging.INFO: _Ansi.CYAN,
+        logging.WARNING: _Ansi.YELLOW,
+        logging.ERROR: _Ansi.RED,
+        logging.CRITICAL: _Ansi.BOLD + _Ansi.RED,
+    }
+
+    def __init__(self, *args, use_color: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_color = use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        # Work on a shallow copy so other handlers (file) stay plain.
+        rec = logging.makeLogRecord(record.__dict__.copy())
+
+        if self.use_color:
+            lvl = self.LEVEL_COLORS.get(rec.levelno, "")
+            if lvl:
+                rec.levelname = f"{lvl}{rec.levelname}{_Ansi.RESET}"
+            rec.msg = _colorize_message(str(rec.msg), enabled=True)
+            rec.args = ()
+
+        return super().format(rec)
 
 def _make_logger() -> logging.Logger:
     logger = logging.getLogger("daemon")
@@ -67,15 +147,20 @@ def _make_logger() -> logging.Logger:
 
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    fmt = logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S UTC")
+    plain_fmt = logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S UTC")
+    color_fmt = ColorFormatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S UTC",
+        use_color=_supports_color(sys.stdout),
+    )
 
     if logger.handlers:
         logger.handlers.clear()
 
     sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
+    sh.setFormatter(color_fmt)
     fh = logging.FileHandler(_log_dir / f"daemon_{datetime.now().strftime('%Y%m%d')}.log")
-    fh.setFormatter(fmt)
+    fh.setFormatter(plain_fmt)
     logger.addHandler(sh)
     logger.addHandler(fh)
     logger._sentient_configured = True
@@ -218,6 +303,41 @@ def retry_delay_for_window(mins_left: float) -> float:
         return 4.0
     return 5.0
 
+
+def _primary_fail_code(reasons: list[str]) -> str:
+    """Return a compact code for the first rejection reason."""
+    if not reasons:
+        return "none"
+    r0 = reasons[0].lower()
+    if "building history" in r0:
+        return "history"
+    if "markov gap" in r0:
+        return "markov"
+    if "blocked utc hour" in r0:
+        return "blocked_hour"
+    if "high vol" in r0:
+        return "vol"
+    if "low efficiency" in r0:
+        return "er"
+    if "timing" in r0:
+        return "timing"
+    if "requires gap" in r0 and "<65" in r0:
+        return "lt65_gap"
+    if r0.startswith("price "):
+        return "price_cap"
+    if "near-strike noise" in r0:
+        return "near_strike"
+    return "other"
+
+
+def price_bucket_sizing(limit_price_cents: int) -> tuple[float, str]:
+    """Simple sizing buckets based on entry price quality from recent backtests."""
+    if limit_price_cents < 65:
+        return 0.50, "lt_65"
+    if limit_price_cents <= 73:
+        return 1.00, "65_73"
+    return 1.00, "gt_73"
+
 # ── Session state ───────────────────────────────────────────────────────────[...]
 class Session:
     def __init__(self, bankroll: float):
@@ -227,6 +347,7 @@ class Session:
         self.peak_pnl      = 0.0
         self.traded        : set[str] = set()   # window IDs already handled
         self.pending       : dict     = {}       # window_id → trade info (awaiting settlement)
+        self.skipped_pending: dict    = {}       # window_id → skipped-market info (awaiting settlement)
         self._date         = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def new_day_check(self):
@@ -326,11 +447,11 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
 
     check_ts = time.time()
 
-    # GK vol + Hurst
+    # GK vol + Kaufman ER
     ctx15   = [c for c in candles_15m if c[0] + 900 <= check_ts]
     last15  = list(reversed(ctx15[-32:])) if len(ctx15) >= 12 else []
     gk      = gk_vol(last15[:16])    if last15 else None
-    hurst   = compute_hurst(last15[:24]) if last15 else None
+    efficiency_ratio = compute_efficiency_ratio(last15[:24], period=ER_PERIOD) if last15 else None
 
     # d-score
     d_score = None
@@ -359,34 +480,38 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
     p_yes        = forecast["p_yes"]
     gap          = abs(p_yes - 0.5)
     persist      = forecast["persist"]
-    has_history  = len(full_history) >= 20
+    has_history  = len(full_history) >= MIN_HISTORY
 
     # Gates
     utc_hour  = datetime.now(timezone.utc).hour
     blocked   = utc_hour in BLOCKED_UTC_HOURS
-    vol_ok    = gk is None or gk <= 0.002 * 1.5  # Allow some extra room for volatility spikes (e.g., 0.0035) without rejecting the trade.
-    hurst_ok  = hurst is None or hurst >= 0.45
+    vol_ok    = gk is None or gk <= REF_VOL_15M * MAX_VOL_MULT
+    er_ok     = efficiency_ratio is None or efficiency_ratio >= MIN_EFFICIENCY_RATIO
     markov_ok = has_history and gap >= MARKOV_MIN_GAP and persist >= MIN_PERSIST
     # Informational tag only; entry timing now always uses ENTRY_WINDOW_*.
     is_golden = 65 <= yes_ask <= 73
     time_ok   = ENTRY_WINDOW_MINUTES_LEFT <= minutes_left <= ENTRY_WINDOW_MAX_MINUTES_LEFT
     side_is_yes = p_yes > 0.5
     limit_price = round(yes_ask if side_is_yes else no_ask)
+    lt65_gap_ok = (limit_price >= 65) or (gap >= LT65_MIN_GAP)
+    sizing_mult, sizing_bucket = price_bucket_sizing(limit_price)
+    scaled_allowance_fraction = min(DAEMON_MAX_TRADE_PCT, max(0.01, allowance_fraction * sizing_mult))
     price_cap   = MAX_ENTRY_PRICE_YES if side_is_yes else MAX_ENTRY_PRICE_NO
     price_ok    = limit_price <= price_cap
-    dist_ok   = abs(dist_pct) >= 0.02
+    dist_ok   = abs(dist_pct) >= MIN_DIST_PCT
 
     reasons: list[str] = []
-    if not has_history:  reasons.append(f"building history ({len(full_history)}/20 candles)")
+    if not has_history:  reasons.append(f"building history ({len(full_history)}/{MIN_HISTORY} candles)")
     if not markov_ok:    reasons.append(f"Markov gap {gap:.3f}<{MARKOV_MIN_GAP} or persist {persist:.2f}<{MIN_PERSIST}")
     if blocked:          reasons.append(f"blocked UTC hour {utc_hour}:00")
     if not vol_ok:       reasons.append(f"high vol (GK={gk:.5f})")
-    if not hurst_ok:     reasons.append(f"mean-reverting (Hurst={hurst:.2f})")
+    if not er_ok:        reasons.append(f"low efficiency (ER={efficiency_ratio:.2f}<{MIN_EFFICIENCY_RATIO:.2f})")
     if not time_ok:      reasons.append(f"timing {minutes_left:.1f}min outside {ENTRY_WINDOW_MINUTES_LEFT:.0f}-{ENTRY_WINDOW_MAX_MINUTES_LEFT:.0f}min window")
+    if not lt65_gap_ok:  reasons.append(f"<65¢ requires gap>={LT65_MIN_GAP:.2f} (got {gap:.3f})")
     if not price_ok:     reasons.append(f"price {limit_price}¢ > {'YES' if side_is_yes else 'NO'} cap {price_cap}¢")
     if not dist_ok:      reasons.append(f"near-strike noise ({dist_pct:.4f}%)")
 
-    all_ok = markov_ok and not blocked and vol_ok and hurst_ok and time_ok and price_ok and dist_ok
+    all_ok = markov_ok and not blocked and vol_ok and er_ok and time_ok and lt65_gap_ok and price_ok and dist_ok
     rec    = ("YES" if p_yes > 0.5 else "NO") if all_ok else "NO_TRADE"
 
     # UI-aligned allowance sizing
@@ -396,7 +521,7 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
     net_win   = (1 - p_d) - fee_c
     cost_c    = p_d + fee_c
     allowance, contracts = allowance_contracts(
-        bankroll, cost_c, allowance_fraction=allowance_fraction, max_contracts=DAEMON_MAX_CONTRACTS,
+        bankroll, cost_c, allowance_fraction=scaled_allowance_fraction, max_contracts=DAEMON_MAX_CONTRACTS,
     ) if rec != "NO_TRADE" else (max(1.0, bankroll * allowance_fraction), 0)
     max_loss  = round(cost_c * contracts, 2)
     ev        = round(contracts * (net_win * p_win - cost_c * (1 - p_win)), 2)
@@ -406,7 +531,10 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
         "recommendation":  rec,
         "ticker":          ticker,
         "limit_price":     limit_price,
-        "allowance_pct":   round(allowance_fraction * 100, 2),
+        "allowance_pct":   round(scaled_allowance_fraction * 100, 2),
+        "base_allowance_pct": round(allowance_fraction * 100, 2),
+        "sizing_multiplier": round(sizing_mult, 3),
+        "sizing_bucket":   sizing_bucket,
         "allowance_usd":   round(allowance, 2),
         "contracts":       contracts,
         "max_loss_usd":    max_loss,
@@ -416,7 +544,7 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
             "p_yes":        round(p_yes, 4),
             "gap":          round(gap, 4),
             "persist":      round(persist, 3),
-            "hurst":        round(hurst, 3) if hurst else None,
+            "efficiency_ratio": round(efficiency_ratio, 3) if efficiency_ratio is not None else None,
             "gk_vol":       round(gk, 6) if gk else None,
             "d_score":      round(d_score, 3) if d_score else None,
             "minutes_left": round(minutes_left, 1),
@@ -600,6 +728,60 @@ async def verify_order_status(order_id: str) -> dict:
     }
 
 
+async def place_ioc_order_and_verify(
+    ticker: str,
+    leg: str,
+    contracts: int,
+    limit_price_cents: int,
+    *,
+    tag: str = "ORDER",
+) -> tuple[str, Optional[dict]]:
+    """Place an IOC buy order and fetch normalized status for quick fill confirmation."""
+    v2_side, price = _v2_book(leg, "buy", limit_price_cents)
+    body = {
+        "ticker":                     ticker,
+        "client_order_id":            str(uuid.uuid4()),
+        "side":                       v2_side,
+        "count":                      f"{contracts:.2f}",
+        "price":                      price,
+        "time_in_force":              "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+    }
+
+    result = await _kpost("/portfolio/events/orders", body)
+    order_id = result.get("order_id") or "unknown"
+    if tag == "ORDER":
+        log.info(f"ORDER PLACED — id={order_id}")
+    else:
+        log.info(f"{tag} PLACED — id={order_id} limit={limit_price_cents}¢")
+
+    order_status = None
+    for _ in range(3):
+        order_status = await verify_order_status(order_id)
+        if _effective_filled_contracts(order_status, contracts) > 0:
+            break
+        await asyncio.sleep(2)
+
+    if order_status:
+        inferred_filled = _effective_filled_contracts(order_status, contracts)
+        if tag == "ORDER":
+            log.info(
+                f"ORDER STATUS — id={order_id} status={order_status['status']} "
+                f"filled={order_status['filled_count']}/{contracts} "
+                f"inferred_filled={inferred_filled}/{contracts} "
+                f"remaining={order_status['remaining_count']}"
+            )
+        else:
+            log.info(
+                f"{tag} STATUS — id={order_id} status={order_status['status']} "
+                f"filled={order_status['filled_count']}/{contracts} "
+                f"inferred_filled={inferred_filled}/{contracts} "
+                f"remaining={order_status['remaining_count']}"
+            )
+
+    return order_id, order_status
+
+
 async def place_limit_sell_order(ticker: str, side: str, contracts: int) -> dict:
     """Place a resting 99-cent GTC sell order to take profit on filled contracts."""
     if contracts <= 0:
@@ -736,6 +918,21 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
         for wid in settled_windows:
             del session.pending[wid]
 
+        # Also resolve windows we skipped near expiry so outcomes are visible in logs.
+        settled_skips = []
+        for wid, skipped in list(session.skipped_pending.items()):
+            result = await check_settlement(skipped["ticker"])
+            if result is not None:
+                log.info(
+                    f"SKIPPED WINDOW RESOLVED | {skipped['ticker']} | "
+                    f"Result={result} | skipped_at={skipped['mins_left']:.1f}min "
+                    f"btc=${skipped['btc_price']:,.0f} strike=${skipped['strike']:,.0f} "
+                    f"Δ{skipped['dist_pct']:+.3f}%"
+                )
+                settled_skips.append(wid)
+        for wid in settled_skips:
+            del session.skipped_pending[wid]
+
         # Refresh bankroll every 30 min
         if time.time() - last_balance_refresh > 1800:
             live_bal = await get_live_bankroll()
@@ -772,6 +969,18 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
             skip_s = (mins_left + 1.5) * 60
             if window_id not in session.traded:
                 log.info(f"Window {window_id} closing ({mins_left:.1f} min) — skip")
+                try:
+                    market = await fetch_market()
+                    if market:
+                        session.skipped_pending[window_id] = {
+                            "ticker": market.get("ticker", "unknown"),
+                            "mins_left": mins_left,
+                            "btc_price": market.get("btc_price", 0.0),
+                            "strike": market.get("strike", 0.0),
+                            "dist_pct": market.get("dist_pct", 0.0),
+                        }
+                except Exception as e:
+                    log.debug(f"Skip-resolution snapshot unavailable: {e}")
                 session.traded.add(window_id)
             await asyncio.sleep(skip_s)
             continue
@@ -811,18 +1020,26 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
         reasons     = signal["rejection_reasons"]
         sig         = signal["signal"]
         mkt         = signal["market"]
+        gate_state  = "PASS" if approved else "FAIL"
+        fail_code   = _primary_fail_code(reasons)
 
         # Status line
         log.info(
             f"BTC ${mkt['btc_price']:,.0f} | Strike ${mkt['strike']:,.0f} | "
             f"Δ{mkt['dist_pct']:+.3f}% | {sig['minutes_left']:.1f}min | "
             f"p(YES)={sig['p_yes']:.1%} gap={sig['gap']:.3f} persist={sig['persist']:.2f} "
+            f"side={'YES' if sig['p_yes'] >= 0.5 else 'NO'} "
+            f"gate={gate_state} fail={fail_code} "
             f"{'[YES65-73]' if sig['is_golden'] else ''}"
         )
 
         if not approved:
             reason_str = " | ".join(reasons) if reasons else "no edge"
-            log.info(f"NO TRADE — {reason_str}")
+            side_hint = "YES" if sig["p_yes"] >= 0.5 else "NO"
+            log.info(
+                f"NO TRADE — ticker={ticker} side={side_hint} lp={limit_price}¢ "
+                f"gap={sig['gap']:.3f} | {reason_str}"
+            )
 
             if should_retry_window(mins_left, reasons):
                 delay_s = retry_delay_for_window(mins_left)
@@ -836,6 +1053,35 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
             continue
 
         # ── TRADE ───────────────────────────────────────────────────────────[...]
+        placed_limit_price = limit_price
+        side_cap = MAX_ENTRY_PRICE_YES if rec == "YES" else MAX_ENTRY_PRICE_NO
+
+        # Optional baseline IOC pad to reduce stale-quote misses.
+        pad_cents = INITIAL_IOC_PAD_CENTS
+        if limit_price < 65:
+            pad_cents += INITIAL_IOC_PAD_LT65_EXTRA_CENTS
+        if pad_cents > 0:
+            padded_price = min(side_cap, placed_limit_price + pad_cents)
+            if padded_price > placed_limit_price:
+                log.info(
+                    f"Initial IOC padding — raising limit {placed_limit_price}¢ → {padded_price}¢ "
+                    f"(base +{INITIAL_IOC_PAD_CENTS}¢"
+                    f"{' + lt65 bonus +' + str(INITIAL_IOC_PAD_LT65_EXTRA_CENTS) + '¢' if limit_price < 65 and INITIAL_IOC_PAD_LT65_EXTRA_CENTS > 0 else ''})"
+                )
+                placed_limit_price = padded_price
+
+        if INITIAL_IOC_USE_CAP:
+            lift_cents = side_cap - placed_limit_price
+            if 0 < lift_cents <= INITIAL_IOC_MAX_LIFT_CENTS:
+                log.info(
+                    f"Initial IOC pricing — lifting limit {placed_limit_price}¢ → {side_cap}¢ "
+                    f"(cap-seeking, max lift {INITIAL_IOC_MAX_LIFT_CENTS}¢)"
+                )
+                placed_limit_price = side_cap
+
+        # Use the actual submitted limit for fill handling and settlement/PnL math.
+        limit_price = placed_limit_price
+
         p_d      = limit_price / 100
         fee_c    = MAKER_FEE_RATE * p_d * (1 - p_d)
         cost_per = p_d + fee_c
@@ -843,7 +1089,8 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
 
         log.info(
             f"{'[DRY RUN] ' if dry_run else ''}TRADE  BUY {rec} {contracts}c @ {limit_price}¢  "
-            f"allowance={signal['allowance_pct']:.0f}% (${signal['allowance_usd']:.2f})  "
+            f"allowance={signal['allowance_pct']:.0f}% (base {signal['base_allowance_pct']:.0f}% x{signal['sizing_multiplier']:.2f}, {signal['sizing_bucket']}) "
+            f"(${signal['allowance_usd']:.2f})  "
             f"max_loss=${signal['max_loss_usd']:.2f}  EV=${signal['expected_value']:+.2f}  "
             f"ticker={ticker}"
         )
@@ -854,39 +1101,13 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
             log.info(f"[DRY RUN] Order simulated — no real order sent")
         else:
             try:
-                leg          = rec.lower()
-                v2_side, price = _v2_book(leg, "buy", limit_price)
-                body = {
-                    "ticker":                     ticker,
-                    "client_order_id":            str(uuid.uuid4()),
-                    "side":                       v2_side,
-                    "count":                      f"{contracts:.2f}",
-                    "price":                      price,
-                    "time_in_force":              "immediate_or_cancel",
-                    "self_trade_prevention_type": "taker_at_cross",
-                }
-                result   = await _kpost("/portfolio/events/orders", body)
-                order_id = result.get("order_id") or "unknown"
-                log.info(f"ORDER PLACED — id={order_id}")
-
-                # Verify the order status immediately so we only track it if it actually filled.
-                order_status = None
-                for _ in range(3):
-                    order_status = await verify_order_status(order_id)
-                    if _effective_filled_contracts(order_status, contracts) > 0:
-                        break
-                    await asyncio.sleep(2)
-
-                if order_status:
-                    status = order_status["status"]
-                    filled_count = order_status["filled_count"]
-                    remaining_count = order_status["remaining_count"]
-                    inferred_filled = _effective_filled_contracts(order_status, contracts)
-                    log.info(
-                        f"ORDER STATUS — id={order_id} status={status} "
-                        f"filled={filled_count}/{contracts} inferred_filled={inferred_filled}/{contracts} "
-                        f"remaining={remaining_count}"
-                    )
+                order_id, order_status = await place_ioc_order_and_verify(
+                    ticker=ticker,
+                    leg=rec.lower(),
+                    contracts=contracts,
+                    limit_price_cents=limit_price,
+                    tag="ORDER",
+                )
             except httpx.HTTPStatusError as e:
                 log.error(f"Kalshi API error {e.response.status_code}: {e.response.text}")
                 session.traded.add(window_id)
@@ -938,6 +1159,37 @@ async def main_loop(dry_run: bool, bankroll: float, allowance_fraction: float):
                                 f"remaining={order_status['remaining_count']}"
                             )
                             break
+
+                if not filled_now and SECOND_CHANCE_RETRY_CENTS > 0:
+                    retry_price = min(99, limit_price + SECOND_CHANCE_RETRY_CENTS)
+                    if retry_price > limit_price:
+                        log.info(
+                            f"Second-chance IOC retry — raising limit {limit_price}¢ → {retry_price}¢ "
+                            f"(can exceed cap by <= {SECOND_CHANCE_RETRY_CENTS}¢)"
+                        )
+                        try:
+                            retry_order_id, retry_status = await place_ioc_order_and_verify(
+                                ticker=ticker,
+                                leg=rec.lower(),
+                                contracts=contracts,
+                                limit_price_cents=retry_price,
+                                tag="ORDER RETRY",
+                            )
+                            order_id = retry_order_id
+                            if retry_status:
+                                order_status = retry_status
+                            filled_now = _effective_filled_contracts(order_status, contracts) > 0 if order_status else False
+                            if filled_now:
+                                # Keep settlement/PnL math aligned with the actual retry fill price.
+                                limit_price = retry_price
+                                p_d = limit_price / 100
+                                fee_c = MAKER_FEE_RATE * p_d * (1 - p_d)
+                                cost_per = p_d + fee_c
+                                net_win = (1 - p_d) - fee_c
+                        except httpx.HTTPStatusError as e:
+                            log.error(f"Kalshi API error on retry {e.response.status_code}: {e.response.text}")
+                        except Exception as e:
+                            log.error(f"Retry order failed: {e}")
 
                 if not filled_now:
                     if should_retry_window(mins_left_now, [fill_info]):
@@ -1003,8 +1255,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sentient autonomous trading daemon")
     parser.add_argument("--dry-run",   action="store_true", help="Simulate trades, no real orders")
     parser.add_argument("--bankroll",  type=float, default=200.0, help="Starting bankroll in USD")
-    parser.add_argument("--allowance-pct", type=float, default=20.0,
-                        help="Percent of bankroll allocated per wager (default: 20)")
+    parser.add_argument("--allowance-pct", type=float, default=KELLY_FRACTION * 100.0,
+                        help=f"Percent of bankroll allocated per wager (default: {KELLY_FRACTION * 100.0:.1f})")
     args = parser.parse_args()
 
     try:
