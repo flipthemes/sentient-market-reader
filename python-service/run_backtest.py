@@ -499,8 +499,24 @@ def process_market(mkt: dict, candles_15m: list, candles_5m: list) -> dict | Non
             continue   # high-vol regime: unpredictable
 
         # Gate 3 — Efficiency Ratio trending regime
-        efficiency_ratio = compute_efficiency_ratio(last_32_15m[:24], period=ER_PERIOD)
-        if efficiency_ratio is not None and efficiency_ratio < MIN_EFFICIENCY_RATIO:
+        #efficiency_ratio = compute_efficiency_ratio(last_32_15m[:24], period=ER_PERIOD)
+        #if efficiency_ratio is not None and efficiency_ratio < MIN_EFFICIENCY_RATIO:
+        #    continue   # choppy regime: direction lock unreliable
+        # Above is the old way; now we compute ER using the exact same data-feed structure as live, to avoid any lookahead bias.
+        
+        # 1. Determine exactly how many candles the function needs (period + 1)
+        # For ER_PERIOD = 20, this will grab exactly 21 candles
+        required_window = ER_PERIOD + 1
+
+        # 2. Slice from the end [-required_window:] to get the most recent candles
+        # Then reverse it so the newest candle sits at index 0, matching live data format
+        backtest_candles_feed = list(reversed(last_32_15m[-required_window:]))
+
+        # 3. Compute the ratio using the exact same restricted data-feed structure as live
+        efficiency_ratio = compute_efficiency_ratio(backtest_candles_feed, period=ER_PERIOD)
+
+        # 4. Filter out the choppy regimes cleanly
+        if efficiency_ratio is None or efficiency_ratio < MIN_EFFICIENCY_RATIO:
             continue   # choppy regime: direction lock unreliable
 
         # Spot price from last completed 5-min candle

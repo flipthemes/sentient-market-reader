@@ -446,12 +446,36 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
     )
 
     check_ts = time.time()
-
+    # Candles were already reversed upstream, didn't need to be reversed again here. 
+    
     # GK vol + Kaufman ER
-    ctx15   = [c for c in candles_15m if c[0] + 900 <= check_ts]
-    last15  = list(reversed(ctx15[-32:])) if len(ctx15) >= 12 else []
-    gk      = gk_vol(last15[:16])    if last15 else None
-    efficiency_ratio = compute_efficiency_ratio(last15[:24], period=ER_PERIOD) if last15 else None
+    #ctx15   = [c for c in candles_15m if c[0] + 900 <= check_ts]
+    #last15  = list(reversed(ctx15[-32:])) if len(ctx15) >= 12 else []
+    #gk      = gk_vol(last15[:16])    if last15 else None
+    #efficiency_ratio = compute_efficiency_ratio(last15[:24], period=ER_PERIOD) if last15 else None
+
+    # Candles were already reversed upstream, didn't need to be reversed again here. 
+    
+    # 1. Gather historical candles safely
+    ctx15 = [c for c in candles_15m if c[0] + 900 <= check_ts]
+
+    #  2. Make sure we have a solid 32 candles of history before doing anything
+    if len(ctx15) >= 32:
+    #  3. Create our list sorted from newest to oldest
+        last15 = list(reversed(ctx15[-32:]))
+    
+        # 4. Calculate Garman-Klass Volatility using the 16 most recent candles
+        gk = gk_vol(last15[:16])
+    
+        # 5. Calculate Efficiency Ratio using EXACTLY the right window size
+        # This prevents the bug where older data corrupts the formula
+        required_window = ER_PERIOD + 1
+        efficiency_ratio = compute_efficiency_ratio(last15[:required_window], period=ER_PERIOD)
+    else:
+    # If we don't have enough data, turn indicators off safely
+        last15 = []
+        gk = None
+        efficiency_ratio = None
 
     # d-score
     d_score = None
@@ -486,7 +510,8 @@ async def run_signal(market: dict, bankroll: float, allowance_fraction: float) -
     utc_hour  = datetime.now(timezone.utc).hour
     blocked   = utc_hour in BLOCKED_UTC_HOURS
     vol_ok    = gk is None or gk <= REF_VOL_15M * MAX_VOL_MULT
-    er_ok     = efficiency_ratio is None or efficiency_ratio >= MIN_EFFICIENCY_RATIO
+    # er_ok     = efficiency_ratio is None or efficiency_ratio >= MIN_EFFICIENCY_RATIO
+    er_ok = efficiency_ratio is not None and efficiency_ratio >= MIN_EFFICIENCY_RATIO
     markov_ok = has_history and gap >= MARKOV_MIN_GAP and persist >= MIN_PERSIST
     # Informational tag only; entry timing now always uses ENTRY_WINDOW_*.
     is_golden = 65 <= yes_ask <= 73
