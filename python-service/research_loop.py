@@ -21,14 +21,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-# ── Env ────────────────────────────────────────────────────────────────────────
-_env_path = Path(__file__).parent.parent / ".env.local"
-if _env_path.exists():
-    for line in _env_path.read_text().splitlines():
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
-
 sys.path.insert(0, os.path.dirname(__file__))
 import run_backtest as _bt
 
@@ -39,18 +31,18 @@ PARAM_GRID = [
     ("MARKOV_MIN_GAP",    [0.08, 0.09, 0.10, 0.11, 0.13, 0.15],  "Markov min gap"),
     ("MIN_PERSIST",       [0.78, 0.80, 0.82, 0.85, 0.87],         "Min persist"),
     ("MAX_ENTRY_PRICE_YES", [68, 70, 71, 72, 73, 74],              "Max YES entry price (¢)"),
-    ("MAX_ENTRY_PRICE_NO",  [58, 60, 62, 65, 68, 70],              "Max NO entry price (¢)"),
+    ("MAX_ENTRY_PRICE_NO",  [60, 62, 65, 68, 70, 72],              "Max NO entry price (¢)"),
     ("MIN_MINUTES_LEFT",  [3,    4,    5,    6,    7],              "Min minutes left"),
     ("MAX_MINUTES_LEFT",  [8,    9,    10,   11,   12],             "Max minutes left"),
     ("MAX_VOL_MULT",      [1.10, 1.15, 1.25, 1.35, 1.50],         "Max vol multiplier"),
-    ("MIN_HURST",         [0.35, 0.40, 0.45, 0.50, 0.55],         "Min Hurst exponent"),
+    ("MIN_EFFICIENCY_RATIO", [0.18, 0.20, 0.22, 0.24, 0.25, 0.28, 0.30], "Min efficiency ratio (ER)"),
 ]
 
-# Score = total_return_pct × win_rate_pct / max(max_drawdown_pct, 1)
+# Score = net_return_pct × win_rate_pct / max(net_drawdown_pct, 1)
 def score(stats: dict) -> float:
-    ret = stats.get("total_return_pct", 0)
+    ret = stats.get("net_return_pct", stats.get("total_return_pct", 0))
     wr  = stats.get("win_rate_pct", 0)
-    dd  = max(stats.get("max_drawdown_pct", 1), 1)
+    dd  = max(stats.get("max_drawdown_pct", stats.get("max_dd_net_pct", 1)), 1)
     n   = stats.get("total_trades", 0)
     if n < 10:
         return -9999  # not enough trades to be meaningful
@@ -71,16 +63,20 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
             if r:
                 records.append(r)
         records.sort(key=lambda r: r["entry_dt"])
-        final_cash = _bt.simulate(records, _bt.SIZING_MODE)
+        final_cash, withdrawn_total, reset_count = _bt.simulate(records, _bt.SIZING_MODE)
+        summary = _bt.summarize_run(
+            markets,
+            records,
+            final_cash,
+            _bt.SIZING_MODE,
+            withdrawn_total=withdrawn_total,
+            reset_count=reset_count,
+        )
         executed   = [r for r in records if r.get("contracts", 0) > 0]
         wins       = [r for r in executed if r.get("outcome_sim", r["outcome"]) == "WIN"]
         losses     = [r for r in executed if r.get("outcome_sim", r["outcome"]) == "LOSS"]
         gw = sum(r["pnl"] for r in wins)
         gl = abs(sum(r["pnl"] for r in losses))
-        peak = _bt.STARTING_CASH; max_dd = 0.0
-        for r in executed:
-            peak   = max(peak, r["cash_after"])
-            max_dd = max(max_dd, (peak - r["cash_after"]) / peak * 100)
         buckets = {}
         for lo, hi, label in [(0,65,"<65¢"),(65,73,"65-73¢"),(73,79,"73-79¢"),(79,85,"79-85¢")]:
             bt_ = [r for r in executed if lo <= r["limit_price_cents"] < hi]
@@ -128,10 +124,16 @@ def _run_with_params(markets, c15, c5, overrides: dict, days: int) -> dict:
             "allowance_pct":     round(_bt.KELLY_FRACTION * 100, 2),
             "starting_cash":     _bt.STARTING_CASH,
             "final_cash":        round(final_cash, 2),
-            "total_return_pct":  round((final_cash / _bt.STARTING_CASH - 1) * 100, 1),
+            "withdrawn_total":   round(withdrawn_total, 2),
+            "net_equity":        round(summary.get("net_equity", final_cash + withdrawn_total), 2),
+            "reset_count":       reset_count,
+            "total_return_pct":  round(summary.get("ret_pct", (final_cash / _bt.STARTING_CASH - 1) * 100), 1),
+            "net_return_pct":    round(summary.get("net_ret_pct", ((final_cash + withdrawn_total) / _bt.STARTING_CASH - 1) * 100), 1),
             "win_rate_pct":      round(len(wins) / max(len(executed), 1) * 100, 1),
             "profit_factor":     round(gw / max(gl, 0.01), 2),
-            "max_drawdown_pct":  round(max_dd, 1),
+            "max_dd_trading_pct": round(summary.get("max_dd_trading", 0.0), 1),
+            "max_dd_net_pct":    round(summary.get("max_dd_net", 0.0), 1),
+            "max_drawdown_pct":  round(summary.get("max_dd_net", 0.0), 1),
             "total_trades":      len(executed),
             "total_wins":        len(wins),
             "total_losses":      len(losses),
@@ -295,7 +297,8 @@ def _current_settings() -> dict:
         "MIN_MINUTES_LEFT": _bt.MIN_MINUTES_LEFT,
         "MAX_MINUTES_LEFT": _bt.MAX_MINUTES_LEFT,
         "MAX_VOL_MULT": _bt.MAX_VOL_MULT,
-        "MIN_HURST": _bt.MIN_HURST,
+        "MIN_EFFICIENCY_RATIO": _bt.MIN_EFFICIENCY_RATIO,
+        "ER_PERIOD": _bt.ER_PERIOD,
         "BLOCKED_UTC_HOURS": sorted(_bt.BLOCKED_UTC_HOURS),
         "SIZING_MODE": _bt.SIZING_MODE,
         "ALLOWANCE_PCT": round(_bt.KELLY_FRACTION * 100, 2),
@@ -321,8 +324,8 @@ def call_claude(baseline: dict, best: Optional[dict], live: dict, all_results: l
     # Build context
     ctx = f"""You are analyzing a live Kalshi BTC binary options trading algorithm.
 The strategy bets YES/NO on whether BTC will be above/below a strike price at each
-15-minute window expiry. Gates: Markov chain momentum signal, Hurst > 0.5 (trending
-regime), Garman-Klass vol < 1.25×ref, timing window (6-9 min, or 3-12 for golden zone
+15-minute window expiry. Gates: Markov chain momentum signal, Kaufman ER >= threshold (trending
+regime), Garman-Klass vol < configured multiple of ref, timing window (6-9 min, or 3-12 for golden zone
 65-73¢), UTC hour blocks (11, 18).
 
 ## Current strategy params
@@ -331,7 +334,7 @@ regime), Garman-Klass vol < 1.25×ref, timing window (6-9 min, or 3-12 for golde
 - MAX_ENTRY_PRICE_RM = {_bt.MAX_ENTRY_PRICE_RM}¢  (entry price cap — 65-73¢ golden zone)
 - MIN_MINUTES_LEFT = {_bt.MIN_MINUTES_LEFT}, MAX_MINUTES_LEFT = {_bt.MAX_MINUTES_LEFT}
 - BLOCKED_UTC_HOURS = {sorted(_bt.BLOCKED_UTC_HOURS)}
-- MIN_HURST = {_bt.MIN_HURST}, MAX_VOL_MULT = {_bt.MAX_VOL_MULT}
+- MIN_EFFICIENCY_RATIO = {_bt.MIN_EFFICIENCY_RATIO}, ER_PERIOD = {_bt.ER_PERIOD}, MAX_VOL_MULT = {_bt.MAX_VOL_MULT}
 - SIZING_MODE = {_bt.SIZING_MODE}
 - ALLOWANCE_PCT = {_bt.KELLY_FRACTION * 100:.0f}%
 - KELLY_FRACTION = {_bt.KELLY_FRACTION} (UI-aligned allowance fraction: bankroll × fraction per wager)
@@ -438,8 +441,8 @@ def propose_branch(best: dict, baseline_score: float) -> Optional[str]:
 def main():
     parser = argparse.ArgumentParser(description="Sentient research loop")
     parser.add_argument("--days",       type=int,  default=30,    help="Backtest lookback days")
-    parser.add_argument("--allowance-pct", type=float, default=20.0,
-                        help="Percent of bankroll allocated per wager in backtest (default: 20)")
+    parser.add_argument("--allowance-pct", type=float, default=_bt.KELLY_FRACTION * 100.0,
+                        help=f"Percent of bankroll allocated per wager in backtest (default: {_bt.KELLY_FRACTION * 100.0:.1f})")
     parser.add_argument("--sizing-mode", choices=["allowance", "legacy-kelly"], default="allowance",
                         help="Backtest sizing model for research runs")
     parser.add_argument("--no-claude",  action="store_true",      help="Skip Claude API call")
@@ -472,10 +475,10 @@ def main():
     print("Running baseline backtest...")
     baseline = _run_with_params(markets, c15, c5, {}, args.days)
     b_score  = score(baseline)
-    print(f"  Baseline: {baseline['total_return_pct']:+.1f}% return | "
+    print(f"  Baseline: {baseline['net_return_pct']:+.1f}% net return | "
           f"{baseline['win_rate_pct']:.1f}% WR | "
           f"{baseline['total_trades']} trades | "
-          f"{baseline['max_drawdown_pct']:.1f}% DD | "
+          f"{baseline['max_dd_net_pct']:.1f}% net DD | "
           f"score={b_score:.1f}\n")
 
     # ── Step 3: Ablation grid ─────────────────────────────────────────────────
@@ -494,7 +497,7 @@ def main():
             s        = score(stats)
             delta    = s - b_score
             marker   = " ★" if delta > 0 else ""
-            print(f"  {label}={val}: {stats['total_return_pct']:+.1f}% | "
+            print(f"  {label}={val}: {stats['net_return_pct']:+.1f}% | "
                   f"{stats['win_rate_pct']:.1f}% WR | "
                   f"{stats['total_trades']}T | score={s:.1f} ({delta:+.1f}){marker}")
             stats["variation_label"] = f"{param_name}={val}"
@@ -555,13 +558,15 @@ def main():
         f"",
         f"| Metric | Value |",
         f"|--------|-------|",
-        f"| Return | {baseline['total_return_pct']:+.1f}% |",
+        f"| Net return | {baseline['net_return_pct']:+.1f}% |",
+        f"| Trading-cash return | {baseline['total_return_pct']:+.1f}% |",
         f"| Win rate | {baseline['win_rate_pct']:.1f}% |",
         f"| Trades | {baseline['total_trades']} |",
         f"| Profit factor | {baseline['profit_factor']:.2f} |",
-        f"| Max drawdown | {baseline['max_drawdown_pct']:.1f}% |",
-        f"",
-        f"**Price buckets:**",
+        f"| Net drawdown | {baseline['max_dd_net_pct']:.1f}% |",
+        f"| Trading-cash drawdown | {baseline['max_dd_trading_pct']:.1f}% |",
+        f"| Withdrawn profits | ${baseline['withdrawn_total']:+.2f} |",
+        f"| Net equity | ${baseline['net_equity']:.2f} |",
         f"",
     ]
 
@@ -596,18 +601,18 @@ def main():
         f"",
         f"## Ablation Study — Top 10 Variations",
         f"",
-        f"| Variation | Return | WR | Trades | DD | Score | Δ |",
-        f"|-----------|--------|-----|--------|-----|-------|---|",
+        f"| Variation | Net Return | WR | Trades | Net DD | Score | Δ |",
+        f"|-----------|------------|-----|--------|--------|-------|---|",
     ]
     for v in all_variations[:10]:
         s = score(v)
         d = s - b_score
         lines.append(
             f"| `{v['variation_label']}` | "
-            f"{v['total_return_pct']:+.1f}% | "
+            f"{v['net_return_pct']:+.1f}% | "
             f"{v['win_rate_pct']:.1f}% | "
             f"{v['total_trades']} | "
-            f"{v['max_drawdown_pct']:.1f}% | "
+            f"{v['max_dd_net_pct']:.1f}% | "
             f"{s:.1f} | "
             f"{d:+.1f} |"
         )

@@ -16,7 +16,7 @@ Entry is simulated at 7.5 min before close (mid of golden 6-9 window).
 5-min candles feed the Markov chain; 15-min candles feed GK vol + Hurst.
 """
 
-import math, time, logging
+import math, os, sys, time, logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -30,38 +30,39 @@ KALSHI_BASE   = "https://api.elections.kalshi.com/trade-api/v2"
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "sentient-agent-backtest/1.0"})
 
+sys.path.insert(0, os.path.dirname(__file__))
+from run_backtest import (
+    MARKOV_MIN_GAP,
+    MIN_PERSIST,
+    MAX_ENTRY_PRICE_YES,
+    MAX_VOL_MULT,
+    MIN_HURST,
+    MIN_MINUTES_LEFT,
+    MAX_MINUTES_LEFT,
+    MIN_DIST_PCT,
+    MAKER_FEE_RATE,
+    MAX_TRADE_PCT,
+    BLOCKED_UTC_HOURS,
+    REF_VOL_15M,
+    KELLY_FRACTION,
+    MARKOV_CANDLE,
+    MARKOV_WINDOW,
+    MIN_HISTORY,
+    STATE_BOUNDS,
+    STATE_RETURNS,
+    STATE_VOL,
+    EMPIRICAL_PRICE_BY_D,
+    NUM_STATES,
+)
+
 # ── Agent constants (must mirror server.py exactly) ───────────────────────────
-MARKOV_MIN_GAP  = 0.11
-MIN_PERSIST     = 0.82
-MAX_ENTRY_PRICE = 72
-MAX_VOL_MULT    = 1.35
-MIN_HURST       = 0.45
-MAKER_FEE_RATE  = 0.0175
-MAX_TRADE_PCT   = 0.20
-BLOCKED_HOURS   = {11, 18}
-REF_VOL_15M     = 0.002
-KELLY_FRACTION  = 0.18
-
-NUM_STATES    = 9
-MARKOV_CANDLE = 5       # minutes
-MARKOV_WINDOW = 480
-MIN_HISTORY   = 20
-STATE_BOUNDS  = [-3.35, -2.24, -1.12, -0.45, 0.45, 1.12, 2.24, 3.35]
-STATE_RETURNS = [-2.0, -1.25, -0.75, -0.35, 0.0,  0.35, 0.75, 1.25, 2.0]
-STATE_VOL     = [ 1.0,  0.35,  0.25,  0.15, 0.10, 0.15, 0.25, 0.35, 1.0]
-
-# Maps |d_score| → estimated yes_ask (cents) — same table as server.py
-EMPIRICAL_PRICE_BY_D = [
-    (0.0, 0.5,  62.3),
-    (0.5, 0.8,  72.7),
-    (0.8, 1.0,  79.1),
-    (1.0, 1.2,  80.8),
-    (1.2, 1.5,  84.6),
-    (1.5, 2.0,  83.6),
-    (2.0, 99.0, 71.0),
-]
-
-ENTRY_MINUTES_LEFT = 7.5   # simulate entry at 7.5 min before close
+MAX_ENTRY_PRICE = MAX_ENTRY_PRICE_YES
+BLOCKED_HOURS = set(BLOCKED_UTC_HOURS)
+ENTRY_MINUTES_LEFT = float(os.environ.get("AGENT_ENTRY_MINUTES_LEFT", "7.5"))
+MCP_GOLDEN_MINUTES_LEFT_MIN = float(os.environ.get("MCP_GOLDEN_MINUTES_LEFT_MIN", "3"))
+MCP_GOLDEN_MINUTES_LEFT_MAX = float(os.environ.get("MCP_GOLDEN_MINUTES_LEFT_MAX", "12"))
+AGENT_DAYS_BACK_DEFAULT = int(float(os.environ.get("AGENT_DAYS_BACK", "30")))
+AGENT_STARTING_CASH_DEFAULT = float(os.environ.get("AGENT_STARTING_CASH", "450.0"))
 
 
 # ── Math (exact copies from server.py) ───────────────────────────────────────
@@ -331,9 +332,13 @@ def _process_market_agent(mkt: dict, candles_5m: list, candles_15m: list) -> Opt
     hurst_ok  = hurst is None or hurst >= MIN_HURST
     markov_ok = has_history and gap >= MARKOV_MIN_GAP and persist >= MIN_PERSIST
     is_golden = 65 <= limit_price <= 73
-    time_ok   = (3 <= minutes_left <= 12) if is_golden else (6 <= minutes_left <= 9)
+    time_ok   = (
+        (MCP_GOLDEN_MINUTES_LEFT_MIN <= minutes_left <= MCP_GOLDEN_MINUTES_LEFT_MAX)
+        if is_golden else
+        (MIN_MINUTES_LEFT <= minutes_left <= MAX_MINUTES_LEFT)
+    )
     price_ok  = limit_price <= MAX_ENTRY_PRICE
-    dist_ok   = abs(dist_pct) >= 0.05
+    dist_ok   = abs(dist_pct) >= MIN_DIST_PCT
 
     reasons = []
     if not has_history:  reasons.append(f"history {len(full_history)}/{MIN_HISTORY}")
@@ -424,7 +429,7 @@ def _simulate(records: list, starting_cash: float) -> dict:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def run_agent_backtest(days_back: int = 30, starting_cash: float = 450.0) -> dict:
+def run_agent_backtest(days_back: int = AGENT_DAYS_BACK_DEFAULT, starting_cash: float = AGENT_STARTING_CASH_DEFAULT) -> dict:
     logger.info(f"[AGENT-BT] Starting {days_back}d agent backtest | ${starting_cash:.0f} | {KELLY_FRACTION*100:.0f}% Kelly")
 
     markets = fetch_settled_markets(days_back)
@@ -467,8 +472,8 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    days  = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-    cash  = float(sys.argv[2]) if len(sys.argv) > 2 else 450.0
+    days  = int(sys.argv[1]) if len(sys.argv) > 1 else AGENT_DAYS_BACK_DEFAULT
+    cash  = float(sys.argv[2]) if len(sys.argv) > 2 else AGENT_STARTING_CASH_DEFAULT
 
     r = run_agent_backtest(days_back=days, starting_cash=cash)
     if not r:

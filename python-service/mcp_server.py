@@ -34,8 +34,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 from run_backtest import (
     fetch_candles_5m, fetch_candles_15m, fetch_settled_markets,
     build_markov_history, build_transition_matrix, predict_from_momentum,
-    price_change_to_state, gk_vol, compute_hurst, simulate, process_market,
+    price_change_to_state, gk_vol, compute_efficiency_ratio, simulate, process_market,
     MARKOV_MIN_GAP, MIN_PERSIST, KELLY_FRACTION, MAX_TRADE_PCT,
+    MIN_EFFICIENCY_RATIO, ER_PERIOD, MAX_VOL_MULT, REF_VOL_15M, MIN_HISTORY, MIN_DIST_PCT,
+    MIN_MINUTES_LEFT, MAX_MINUTES_LEFT,
     MAX_ENTRY_PRICE_RM, MAX_ENTRY_PRICE_YES, MAX_ENTRY_PRICE_NO,
     MAKER_FEE_RATE, STARTING_CASH, DAYS_BACK,
     EMPIRICAL_PRICE_BY_D, BLOCKED_UTC_HOURS,
@@ -47,13 +49,9 @@ logging.basicConfig(level=logging.WARNING)
 KALSHI_BASE  = "https://api.elections.kalshi.com/trade-api/v2"
 NEXT_BASE    = os.environ.get("NEXT_BASE_URL", "http://localhost:3000")
 
-# Load .env.local for Kalshi creds if not already in env
-_env_path = Path(__file__).parent.parent / ".env.local"
-if _env_path.exists():
-    for line in _env_path.read_text().splitlines():
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
+MCP_GOLDEN_MINUTES_LEFT_MIN = float(os.environ.get("MCP_GOLDEN_MINUTES_LEFT_MIN", "3"))
+MCP_GOLDEN_MINUTES_LEFT_MAX = float(os.environ.get("MCP_GOLDEN_MINUTES_LEFT_MAX", "12"))
+MCP_MIN_HISTORY = int(float(os.environ.get("MCP_MIN_HISTORY", str(MIN_HISTORY))))
 
 KALSHI_API_KEY   = os.environ.get("KALSHI_API_KEY", "")
 KALSHI_KEY_PATH  = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private.pem")
@@ -139,7 +137,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Run the full Markov chain signal analysis on the current market. "
                 "Returns: pYes, recommendation (YES/NO/NO_TRADE), Kelly position size, "
-                "persist score, Hurst exponent, vol regime, and a full reasoning string. "
+                "persist score, Efficiency Ratio (Kaufman ER), vol regime, and a full reasoning string. "
                 "This is the core trading intelligence — use this to decide whether to trade."
             ),
             inputSchema={
@@ -344,7 +342,7 @@ async def _dispatch(name: str, args: dict) -> Any:
         ctx15 = [c for c in candles_15m if c[0] + 900 <= check_ts]
         last_15m = list(reversed(ctx15[-32:])) if len(ctx15) >= 12 else []
         gk = gk_vol(last_15m[:16]) if last_15m else None
-        hurst = compute_hurst(last_15m[:24]) if last_15m else None
+        efficiency_ratio = compute_efficiency_ratio(last_15m[:24], period=ER_PERIOD) if last_15m else None
 
         # d-score
         d_score = None
@@ -371,15 +369,20 @@ async def _dispatch(name: str, args: dict) -> Any:
         p_yes        = forecast["p_yes"]
         gap          = abs(p_yes - 0.5)
         persist      = forecast["persist"]
-        has_history  = len(full_history) >= 20
+        has_history  = len(full_history) >= MCP_MIN_HISTORY
 
         # Gates
         utc_hour = datetime.now(timezone.utc).hour
         blocked  = utc_hour in BLOCKED_UTC_HOURS
-        vol_ok   = gk is None or gk <= 0.002 * 1.25
-        hurst_ok = hurst is None or hurst >= 0.50
+        vol_ok   = gk is None or gk <= REF_VOL_15M * MAX_VOL_MULT
+        er_ok    = efficiency_ratio is None or efficiency_ratio >= MIN_EFFICIENCY_RATIO
         markov_ok = has_history and gap >= MARKOV_MIN_GAP and persist >= MIN_PERSIST
-        time_ok  = 3 <= minutes_left <= 12 if (65 <= yes_ask <= 73) else 6 <= minutes_left <= 9
+        time_ok  = (
+            MCP_GOLDEN_MINUTES_LEFT_MIN <= minutes_left <= MCP_GOLDEN_MINUTES_LEFT_MAX
+            if (65 <= yes_ask <= 73)
+            else MIN_MINUTES_LEFT <= minutes_left <= MAX_MINUTES_LEFT
+        )
+        dist_ok = abs(dist_pct) >= MIN_DIST_PCT
 
         # Entry price
         d_abs = abs(d_score) if d_score is not None else 0
@@ -393,7 +396,7 @@ async def _dispatch(name: str, args: dict) -> Any:
         price_ok    = limit_price <= price_cap
 
         rec = "NO_TRADE"
-        if markov_ok and not blocked and vol_ok and hurst_ok and time_ok and price_ok:
+        if markov_ok and not blocked and vol_ok and er_ok and time_ok and dist_ok and price_ok:
             rec = "YES" if side_is_yes else "NO"
 
         # Kelly sizing
@@ -414,12 +417,13 @@ async def _dispatch(name: str, args: dict) -> Any:
         ev           = round(contracts * (net_win * p_win - total_cost * (1 - p_win)), 2)
 
         reasons = []
-        if not has_history:    reasons.append(f"building Markov history ({len(full_history)}/20)")
+        if not has_history:    reasons.append(f"building Markov history ({len(full_history)}/{MCP_MIN_HISTORY})")
         if not markov_ok:      reasons.append(f"Markov gap {gap:.3f} < {MARKOV_MIN_GAP} or persist {persist:.2f} < {MIN_PERSIST}")
         if blocked:            reasons.append(f"blocked UTC hour {utc_hour}")
         if not vol_ok:         reasons.append(f"high vol regime (GK={gk:.4f})")
-        if not hurst_ok:       reasons.append(f"mean-reverting (Hurst={hurst:.2f})")
+        if not er_ok:          reasons.append(f"low efficiency (ER={efficiency_ratio:.2f}<{MIN_EFFICIENCY_RATIO:.2f})")
         if not time_ok:        reasons.append(f"timing: {minutes_left:.1f}min outside window")
+        if not dist_ok:        reasons.append(f"near-strike noise ({dist_pct:.4f}%)")
         if not price_ok:       reasons.append(f"price {limit_price}¢ > {'YES' if side_is_yes else 'NO'} cap {price_cap}¢")
 
         return {
@@ -437,7 +441,7 @@ async def _dispatch(name: str, args: dict) -> Any:
                 "persist":        round(persist, 3),
                 "current_state":  current_state,
                 "history_len":    len(full_history),
-                "hurst":          round(hurst, 3) if hurst else None,
+                "efficiency_ratio": round(efficiency_ratio, 3) if efficiency_ratio is not None else None,
                 "gk_vol":         round(gk, 6) if gk else None,
                 "d_score":        round(d_score, 3) if d_score is not None else None,
                 "minutes_left":   round(minutes_left, 1),
@@ -447,8 +451,9 @@ async def _dispatch(name: str, args: dict) -> Any:
                 "markov":    markov_ok,
                 "timing":    time_ok,
                 "vol":       vol_ok,
-                "hurst":     hurst_ok,
+                "efficiency": er_ok,
                 "price_cap": price_ok,
+                "dist":      dist_ok,
                 "not_blocked": not blocked,
             },
             "rejection_reasons": reasons,

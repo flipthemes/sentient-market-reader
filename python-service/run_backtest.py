@@ -5,7 +5,7 @@ Goal: predict BTC up/down correctly for every window. Make the RIGHT BETS.
 Signals:
   1. Markov gap ≥ 0.15    — 5-min chain, 65%+ directional confidence
   2. Markov persist ≥ 0.82— chain locked in state (not noise)
-  3. Hurst > 0.50         — trending regime; mean-reversion = skip
+    3. ER >= threshold      — Kaufman efficiency; choppy regime = skip
   4. Velocity gate        — price not rushing toward strike >40% of crossing speed
   5. Vol ≤ 1.25×ref       — skip chaotic high-vol windows
   6. Entry 6–9 min left   — 6-9min = 98.3% WR on live fills
@@ -35,29 +35,108 @@ _S = requests.Session()
 _S.headers["User-Agent"] = "Mozilla/5.0"
 _S.verify = False   # local backtest — macOS cert chain issue
 
+
+def _load_env_local() -> None:
+    """Load .env.local once, preferring workspace root then python-service."""
+    base_dir = os.path.dirname(__file__)
+    env_paths = [
+        os.path.join(os.path.dirname(base_dir), ".env.local"),
+        os.path.join(base_dir, ".env.local"),
+    ]
+    for env_path in env_paths:
+        if not os.path.exists(env_path):
+            continue
+        with open(env_path, encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(float(raw.strip()))
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw.strip())
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip()
+
+
+def _env_optional_int(name: str, default: int | None) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    lowered = raw.strip().lower()
+    if lowered in {"none", "null", "inf", "infinite", "unlimited"}:
+        return None
+    return int(float(raw.strip()))
+
+
+def _env_int_set(name: str, default: set[int]) -> set[int]:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return set(default)
+    values: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.add(int(token))
+    return values
+
+
+_load_env_local()
+
 # ── Strategy parameters ───────────────────────────────────────────────────────
-STARTING_CASH        = 200.00
-DAYS_BACK            = 30
+STARTING_CASH         = _env_float("STARTING_CASH", 200.00)
+DAYS_BACK             = _env_int("DAYS_BACK", 30)
+RESET_TRIGGER_DEFAULT = _env_float("RESET_TRIGGER", 300.0)  # Skim and reset bankroll when cash reaches this threshold.
+RESET_TO_DEFAULT      = _env_float("RESET_TO", 200.0)       # Bankroll to continue trading with after each skim event.
 
 # No d-gate
-D_THRESHOLD          = 0.0
-D_MAX_THRESHOLD      = 99.0
+D_THRESHOLD           = _env_float("D_THRESHOLD", 0.0)
+D_MAX_THRESHOLD       = _env_float("D_MAX_THRESHOLD", 99.0)
 
 # Timing
-MIN_MINUTES_LEFT     = 3
-MAX_MINUTES_LEFT     = 9
+MIN_MINUTES_LEFT      = _env_float("MIN_MINUTES_LEFT", 3)
+MAX_MINUTES_LEFT      = _env_float("MAX_MINUTES_LEFT", 9)
 
-# Hurst
-MIN_HURST            = 0.45            # 0.50 default
+# Kaufman Efficiency Ratio (ER)
+# Backward compatibility: if MIN_EFFICIENCY_RATIO is unset, fall back to legacy MIN_HURST.
+MIN_EFFICIENCY_RATIO  = _env_float("MIN_EFFICIENCY_RATIO", _env_float("MIN_HURST", 0.24))
+ER_PERIOD             = _env_int("ER_PERIOD", 8)
+# Legacy aliases kept for older imports.
+MIN_HURST             = MIN_EFFICIENCY_RATIO
 # Velocity gate
-VEL_SAFETY_RATIO     = 0.40
+VEL_SAFETY_RATIO      = _env_float("VEL_SAFETY_RATIO", 0.40)
 
 # Markov: 65%+ conviction + state must be locked in (not noise)
-MARKOV_MIN_GAP       = 0.11
-MIN_PERSIST          = 0.82
+MARKOV_MIN_GAP        = _env_float("MARKOV_MIN_GAP", 0.11)
+MIN_PERSIST           = _env_float("MIN_PERSIST", 0.82)
+LT65_MIN_GAP          = _env_float("LT65_MIN_GAP", 0.14)  # For <65c entries, require stronger confidence.
 
 # Vol regime
-MAX_VOL_MULT         = 1.35
+MAX_VOL_MULT          = _env_float("MAX_VOL_MULT", 1.35)
 
 # UI-aligned allowance sizing.
 # Use a fixed allowance equal to a configured fraction of current bankroll,
@@ -67,30 +146,30 @@ MAX_VOL_MULT         = 1.35
 # YES≤72¢: all buckets ≤72¢ are +EV. YES 72¢+ = -$9.34/trade (67% WR vs 76% needed).
 # NO≤65¢:  NO 65-72¢ = -$7.71/trade (53% WR vs 69% needed) — consensus-following bad payout.
 # Backtest unchanged: EMPIRICAL_PRICE_BY_D never generates NO above ~38¢, so NO cap is implicit.
-MIN_ENTRY_PRICE_RM   = 0     # no floor — let any price through
-MAX_ENTRY_PRICE_YES  = 72    # ¢ — YES cap: market underprices our momentum signal at ≤72¢
-MAX_ENTRY_PRICE_NO   = 65    # ¢ — NO cap: above 65¢ NO = consensus trade with bad payout ratio
-MAX_ENTRY_PRICE_RM   = MAX_ENTRY_PRICE_YES  # kept for external imports expecting this name
-MIN_DIST_PCT         = 0.04
-MAX_CONTRACTS_RM     = 500
-REF_VOL_15M          = 0.002
-MAX_TRADE_PCT        = 0.20
-KELLY_FRACTION       = 0.18
-DAEMON_MAX_TRADE_PCT = 0.35
-DAEMON_MAX_CONTRACTS = 50
-SIZING_MODE          = "allowance"
-MAX_TRADES_PER_DAY   = 48
-MAX_DAILY_LOSS_PCT   = 25
-MAX_DAILY_LOSS_FLOOR = 0
-MAX_DAILY_LOSS_CAP   = 500
-MAX_GIVEBACK_MULT    = 1.4
-POLLER_INTERVAL_MIN  = 0.5
-BLOCKED_UTC_HOURS    = {8, 11, 16, 18, 21}  # live data: 8=44%WR, 16=36%WR, 21=40%WR (147 fills Apr 19-22)
+MIN_ENTRY_PRICE_RM    = _env_int("MIN_ENTRY_PRICE_RM", 0)     # no floor — let any price through
+MAX_ENTRY_PRICE_YES   = _env_int("MAX_ENTRY_PRICE_YES", 72)   # ¢ — YES cap: market underprices our momentum signal at ≤72¢
+MAX_ENTRY_PRICE_NO    = _env_int("MAX_ENTRY_PRICE_NO", 65)    # ¢ — NO cap: above 65¢ NO = consensus trade with bad payout ratio
+MAX_ENTRY_PRICE_RM    = _env_int("MAX_ENTRY_PRICE_RM", MAX_ENTRY_PRICE_YES)  # kept for external imports expecting this name
+MIN_DIST_PCT          = _env_float("MIN_DIST_PCT", 0.04)
+MAX_CONTRACTS_RM      = _env_int("MAX_CONTRACTS_RM", 500)
+REF_VOL_15M           = _env_float("REF_VOL_15M", 0.002)
+MAX_TRADE_PCT         = _env_float("MAX_TRADE_PCT", 0.20)
+KELLY_FRACTION        = _env_float("KELLY_FRACTION", 0.18)
+DAEMON_MAX_TRADE_PCT  = _env_float("DAEMON_MAX_TRADE_PCT", 0.35)
+DAEMON_MAX_CONTRACTS  = _env_optional_int("DAEMON_MAX_CONTRACTS", None)  # No hard contract cap; sizing is allowance-driven.
+SIZING_MODE           = _env_str("SIZING_MODE", "allowance")
+MAX_TRADES_PER_DAY    = _env_int("MAX_TRADES_PER_DAY", 48)
+MAX_DAILY_LOSS_PCT    = _env_float("MAX_DAILY_LOSS_PCT", 25)
+MAX_DAILY_LOSS_FLOOR  = _env_float("MAX_DAILY_LOSS_FLOOR", 0)
+MAX_DAILY_LOSS_CAP    = _env_float("MAX_DAILY_LOSS_CAP", 500)
+MAX_GIVEBACK_MULT     = _env_float("MAX_GIVEBACK_MULT", 1.4)
+POLLER_INTERVAL_MIN   = _env_float("POLLER_INTERVAL_MIN", 0.5)
+BLOCKED_UTC_HOURS     = _env_int_set("BLOCKED_UTC_HOURS", {8, 11, 16, 18, 21})  # live data: 8=44%WR, 16=36%WR, 21=40%WR (147 fills Apr 19-22)
 
-MAKER_FEE_RATE     = 0.0175
-MAX_ORDER_DEPTH    = 25
-SLIPPAGE_FREE_CTRS = 10
-SLIPPAGE_CENTS_PER = 0.5
+MAKER_FEE_RATE      = _env_float("MAKER_FEE_RATE", 0.0175)
+MAX_ORDER_DEPTH     = _env_int("MAX_ORDER_DEPTH", 25)
+SLIPPAGE_FREE_CTRS  = _env_int("SLIPPAGE_FREE_CTRS", 10)
+SLIPPAGE_CENTS_PER  = _env_float("SLIPPAGE_CENTS_PER", 0.5)
 
 EMPIRICAL_PRICE_BY_D = [
     (0.0, 0.5,  62.3),
@@ -124,23 +203,29 @@ def norm_cdf(z: float) -> float:
     return 0.5 + sign * (0.5 - pdf * poly)
 
 
+def compute_efficiency_ratio(candles_newest: list, period: int = ER_PERIOD) -> float | None:
+    """
+    Kaufman's Efficiency Ratio on close prices.
+    ER = abs(close_t - close_{t-period}) / sum(abs(delta_close_i))
+    Range: 0..1 (higher = cleaner trend, lower = choppy/noisy).
+    """
+    closes = [float(c[4]) for c in reversed(candles_newest)]
+    if period < 1 or len(closes) < period + 1:
+        return None
+
+    net_change = abs(closes[-1] - closes[-1 - period])
+    path = 0.0
+    for i in range(len(closes) - period, len(closes)):
+        path += abs(closes[i] - closes[i - 1])
+
+    if path <= 0:
+        return 0.0
+    return max(0.0, min(1.0, net_change / path))
+
+
 def compute_hurst(candles_newest: list) -> float | None:
-    """
-    Hurst exponent via variance-ratio method on 15-min log-returns.
-    > 0.5 = trending (momentum persists). < 0.5 = mean-reverting.
-    """
-    closes = [c[4] for c in reversed(candles_newest)]
-    if len(closes) < 12:
-        return None
-    lr = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
-    if len(lr) < 6:
-        return None
-    var1 = sum(r * r for r in lr) / len(lr)
-    pairs = [lr[i] + lr[i + 1] for i in range(0, len(lr) - 1, 2)]
-    var2  = sum(r * r for r in pairs) / max(len(pairs), 1) if pairs else 0.0
-    if var1 <= 0:
-        return None
-    return max(0.0, min(1.0, 0.5 + math.log(max(var2 / (2 * var1), 1e-12)) / (2 * math.log(2))))
+    """Legacy alias kept for compatibility; now returns Kaufman ER."""
+    return compute_efficiency_ratio(candles_newest, period=ER_PERIOD)
 
 
 def compute_rsi(closes: list, period: int = 14) -> float | None:
@@ -400,7 +485,7 @@ def process_market(mkt: dict, candles_15m: list, candles_5m: list) -> dict | Non
         if datetime.fromtimestamp(check_ts, tz=timezone.utc).hour in BLOCKED_UTC_HOURS:
             continue
 
-        # 15-min context for GK vol + Hurst
+        # 15-min context for GK vol + ER
         ctx15 = [c for c in candles_15m if c[0] + 900 <= check_ts]
         if len(ctx15) < 12:
             continue
@@ -413,10 +498,10 @@ def process_market(mkt: dict, candles_15m: list, candles_5m: list) -> dict | Non
         if gk > REF_VOL_15M * MAX_VOL_MULT:
             continue   # high-vol regime: unpredictable
 
-        # Gate 3 — Hurst trending regime
-        hurst = compute_hurst(last_32_15m[:24])
-        if hurst is not None and hurst < MIN_HURST:
-            continue   # mean-reverting: direction lock unreliable
+        # Gate 3 — Efficiency Ratio trending regime
+        efficiency_ratio = compute_efficiency_ratio(last_32_15m[:24], period=ER_PERIOD)
+        if efficiency_ratio is not None and efficiency_ratio < MIN_EFFICIENCY_RATIO:
+            continue   # choppy regime: direction lock unreliable
 
         # Spot price from last completed 5-min candle
         c5_ts  = int(check_ts // (MARKOV_CANDLE * 60)) * MARKOV_CANDLE * 60 - MARKOV_CANDLE * 60
@@ -468,7 +553,8 @@ def process_market(mkt: dict, candles_15m: list, candles_5m: list) -> dict | Non
         p_yes        = forecast['p_yes']
 
         # Gate 5 — Markov confidence
-        if abs(p_yes - 0.5) < MARKOV_MIN_GAP:
+        p_gap = abs(p_yes - 0.5)
+        if p_gap < MARKOV_MIN_GAP:
             continue
 
         # Gate 6 — Markov persistence: chain locked in state (not noise)
@@ -505,7 +591,10 @@ def process_market(mkt: dict, candles_15m: list, candles_5m: list) -> dict | Non
         if side_max_bt > 0 and limit_price_cents > side_max_bt:
             continue
 
-        p_gap      = abs(p_yes - 0.5)
+        # Subset skip for weaker low-price entries: keep <65c only when confidence is stronger.
+        if limit_price_cents < 65 and p_gap < LT65_MIN_GAP:
+            continue
+
         confidence = 'high' if p_gap >= 0.15 else 'medium' if p_gap >= 0.07 else 'low'
         won        = (rec == result)
 
@@ -529,7 +618,8 @@ def process_market(mkt: dict, candles_15m: list, candles_5m: list) -> dict | Non
             'enter_signal':       forecast['enter_yes'] if rec == 'yes' else forecast['enter_no'],
             'limit_price_cents':  limit_price_cents,
             'gk_vol':             round(gk, 6),
-            'hurst':              round(hurst, 3) if hurst is not None else None,
+            'efficiency_ratio':   round(efficiency_ratio, 3) if efficiency_ratio is not None else None,
+            'hurst':              round(efficiency_ratio, 3) if efficiency_ratio is not None else None,
             'rsi':                round(rsi, 1) if rsi is not None else None,
             'confidence':         confidence,
             'history_len':        len(full_history),
@@ -550,19 +640,30 @@ def kalshi_fee(contracts: int, price_cents: float) -> float:
 
 def allowance_contracts(bankroll: float, total_cost_per_contract: float,
                         allowance_fraction: float | None = None,
-                        max_contracts: int = DAEMON_MAX_CONTRACTS) -> tuple[float, int]:
+                        max_contracts: int | None = DAEMON_MAX_CONTRACTS) -> tuple[float, int]:
     if allowance_fraction is None:
         allowance_fraction = KELLY_FRACTION
     allowance = max(1.0, bankroll * allowance_fraction)
     if total_cost_per_contract <= 0:
         return allowance, 0
-    contracts = min(max(1, math.floor(allowance / total_cost_per_contract)), max_contracts)
+    contracts = max(1, math.floor(allowance / total_cost_per_contract))
+    if max_contracts is not None:
+        contracts = min(contracts, max_contracts)
     return allowance, contracts
+
+
+def price_bucket_sizing(limit_price_cents: int) -> tuple[float, str]:
+    """Match live daemon: scale allowance by entry-price quality bucket."""
+    if limit_price_cents < 65:
+        return 0.50, "lt_65"
+    if limit_price_cents <= 73:
+        return 1.00, "65_73"
+    return 1.00, "gt_73"
 
 
 def legacy_kelly_contracts(bankroll: float, total_cost_per_contract: float,
                            p_win: float, limit_price_cents: float,
-                           max_contracts: int = DAEMON_MAX_CONTRACTS) -> tuple[float, float, int]:
+                           max_contracts: int | None = DAEMON_MAX_CONTRACTS) -> tuple[float, float, int]:
     p_dollars     = limit_price_cents / 100.0
     fee_per_c_raw = MAKER_FEE_RATE * p_dollars * (1 - p_dollars)
     net_win_per_c = (1.0 - p_dollars) - fee_per_c_raw
@@ -579,15 +680,26 @@ def legacy_kelly_contracts(bankroll: float, total_cost_per_contract: float,
         frac = 0.05
 
     risk_pct  = min(DAEMON_MAX_TRADE_PCT, frac * kelly_full)
-    contracts = min(max(1, round(bankroll * risk_pct / total_cost_per_contract)), max_contracts)
+    contracts = max(1, round(bankroll * risk_pct / total_cost_per_contract))
+    if max_contracts is not None:
+        contracts = min(contracts, max_contracts)
     return kelly_full, risk_pct, contracts
 
 
-def simulate(records: list, sizing_mode: str | None = None) -> float:
+def simulate(records: list, sizing_mode: str | None = None,
+             reset_trigger: float | None = None,
+             reset_to: float | None = None) -> tuple[float, float, int]:
     if sizing_mode is None:
         sizing_mode = SIZING_MODE
+    if reset_trigger is None:
+        reset_trigger = RESET_TRIGGER_DEFAULT
+    if reset_to is None:
+        reset_to = RESET_TO_DEFAULT
+
     ET_OFFSET = timedelta(hours=5)
     cash = STARTING_CASH
+    withdrawn_total = 0.0
+    reset_count = 0
     session_daily_pnl = session_peak_pnl = 0.0
     session_trade_count = 0
     session_date_et = None
@@ -613,7 +725,15 @@ def simulate(records: list, sizing_mode: str | None = None) -> float:
         elif session_trade_count >= MAX_TRADES_PER_DAY: skip_reason = 'max_trades'
 
         if skip_reason:
-            r.update(contracts=0, cost=0.0, pnl=0.0, cash_after=round(cash, 2), skipped_reason=skip_reason)
+            r.update(
+                contracts=0,
+                cost=0.0,
+                pnl=0.0,
+                cash_after=round(cash, 2),
+                withdrawn_total_after=round(withdrawn_total, 2),
+                net_equity_after=round(cash + withdrawn_total, 2),
+                skipped_reason=skip_reason,
+            )
             continue
 
         p_dollars        = lp / 100.0
@@ -624,10 +744,20 @@ def simulate(records: list, sizing_mode: str | None = None) -> float:
         allowance  = None
         kelly_full = None
         risk_pct   = None
+        sizing_mult = None
+        sizing_bucket = None
+        scaled_allowance_fraction = None
         if sizing_mode == 'legacy-kelly':
             kelly_full, risk_pct, contracts = legacy_kelly_contracts(cash, cost_per_contract, p_win, lp)
         else:
-            allowance, contracts = allowance_contracts(cash, cost_per_contract)
+            sizing_mult, sizing_bucket = price_bucket_sizing(lp)
+            scaled_allowance_fraction = min(DAEMON_MAX_TRADE_PCT, max(0.01, KELLY_FRACTION * sizing_mult))
+            allowance, contracts = allowance_contracts(
+                cash,
+                cost_per_contract,
+                allowance_fraction=scaled_allowance_fraction,
+                max_contracts=DAEMON_MAX_CONTRACTS,
+            )
 
         avg_cents = (SLIPPAGE_FREE_CTRS * lp + (contracts - SLIPPAGE_FREE_CTRS) *
                      (lp + (contracts - SLIPPAGE_FREE_CTRS) * SLIPPAGE_CENTS_PER / 2)
@@ -640,6 +770,14 @@ def simulate(records: list, sizing_mode: str | None = None) -> float:
 
         pnl  = contracts * (net_win if r['outcome'] == 'WIN' else net_loss)
         cash = max(0.0, cash + pnl)
+
+        # Optional bankroll skim/reset: lock in gains and keep betting from a fixed base bankroll.
+        if reset_trigger and reset_trigger > 0 and reset_to is not None and cash >= reset_trigger and cash > reset_to:
+            skim = cash - reset_to
+            withdrawn_total += skim
+            reset_count += 1
+            cash = reset_to
+
         session_daily_pnl   += pnl
         session_peak_pnl     = max(session_peak_pnl, session_daily_pnl)
         session_trade_count += 1
@@ -650,20 +788,27 @@ def simulate(records: list, sizing_mode: str | None = None) -> float:
             'cost': round(contracts * (p_eff + fee_per_c), 2),
             'pnl': round(pnl, 2),
             'cash_after': round(cash, 2),
+            'withdrawn_total_after': round(withdrawn_total, 2),
+            'net_equity_after': round(cash + withdrawn_total, 2),
             'outcome_sim': r['outcome'],
         }
         if allowance is not None:
-            update['allowance_pct'] = round(KELLY_FRACTION * 100, 2)
+            update['base_allowance_pct'] = round(KELLY_FRACTION * 100, 2)
+            update['allowance_pct'] = round((scaled_allowance_fraction or KELLY_FRACTION) * 100, 2)
+            update['sizing_multiplier'] = round(sizing_mult or 1.0, 3)
+            update['sizing_bucket'] = sizing_bucket or 'unknown'
             update['allowance'] = round(allowance, 2)
         if kelly_full is not None and risk_pct is not None:
             update['kelly_full'] = round(kelly_full, 6)
             update['risk_pct'] = round(risk_pct, 6)
         r.update(update)
 
-    return cash
+    return cash, withdrawn_total, reset_count
 
 
-def summarize_run(markets: list, records: list, final_cash: float, sizing_mode: str) -> dict:
+def summarize_run(markets: list, records: list, final_cash: float, sizing_mode: str,
+                  withdrawn_total: float = 0.0,
+                  reset_count: int = 0) -> dict:
     executed   = [r for r in records if r.get('contracts', 0) > 0]
     skipped_rm = [r for r in records if r.get('contracts', 0) == 0]
     wins       = [r for r in executed if r.get('outcome_sim', r['outcome']) == 'WIN']
@@ -677,13 +822,22 @@ def summarize_run(markets: list, records: list, final_cash: float, sizing_mode: 
         skip_reasons[key] = skip_reasons.get(key, 0) + 1
 
     max_cash = STARTING_CASH
-    max_dd = 0.0
+    max_dd_trading = 0.0
+    max_net_equity = STARTING_CASH
+    max_dd_net = 0.0
     cur_s = max_ws = max_ls = 0
     last_oc = None
     for r in executed:
         oc = r.get('outcome_sim', r['outcome'])
         max_cash = max(max_cash, r['cash_after'])
-        max_dd   = max(max_dd, (max_cash - r['cash_after']) / max_cash * 100)
+        max_dd_trading = max(max_dd_trading, (max_cash - r['cash_after']) / max(max_cash, 1e-9) * 100)
+
+        net_after = r.get('net_equity_after')
+        if net_after is None:
+            net_after = r['cash_after'] + r.get('withdrawn_total_after', 0.0)
+        max_net_equity = max(max_net_equity, float(net_after))
+        max_dd_net = max(max_dd_net, (max_net_equity - float(net_after)) / max(max_net_equity, 1e-9) * 100)
+
         cur_s    = cur_s + 1 if oc == last_oc else 1
         if oc == 'WIN':
             max_ws = max(max_ws, cur_s)
@@ -693,7 +847,10 @@ def summarize_run(markets: list, records: list, final_cash: float, sizing_mode: 
 
     wr       = len(wins) / max(len(executed), 1) * 100
     pnl      = final_cash - STARTING_CASH
+    net_equity = final_cash + withdrawn_total
+    net_pnl    = net_equity - STARTING_CASH
     ret_pct  = (final_cash / STARTING_CASH - 1) * 100
+    net_ret_pct = (net_equity / STARTING_CASH - 1) * 100
     avg_win  = sum(r['pnl'] for r in wins) / max(len(wins), 1)
     avg_loss = sum(r['pnl'] for r in losses) / max(len(losses), 1)
     gw       = sum(r['pnl'] for r in wins)
@@ -704,6 +861,9 @@ def summarize_run(markets: list, records: list, final_cash: float, sizing_mode: 
         'markets': markets,
         'records': records,
         'final_cash': final_cash,
+        'withdrawn_total': withdrawn_total,
+        'reset_count': reset_count,
+        'net_equity': net_equity,
         'executed': executed,
         'skipped_rm': skipped_rm,
         'wins': wins,
@@ -712,10 +872,15 @@ def summarize_run(markets: list, records: list, final_cash: float, sizing_mode: 
         'strong_w': strong_w,
         'skip_reasons': skip_reasons,
         'max_cash': max_cash,
-        'max_dd': max_dd,
+        'max_dd': max_dd_trading,
+        'max_dd_trading': max_dd_trading,
+        'max_net_equity': max_net_equity,
+        'max_dd_net': max_dd_net,
         'wr': wr,
         'pnl': pnl,
+        'net_pnl': net_pnl,
         'ret_pct': ret_pct,
+        'net_ret_pct': net_ret_pct,
         'avg_win': avg_win,
         'avg_loss': avg_loss,
         'gw': gw,
@@ -735,8 +900,11 @@ def print_compare_summary(allowance_summary: dict, legacy_summary: dict) -> None
     print(f"  {'Executed trades':<24} {len(allowance_summary['executed']):>14} {len(legacy_summary['executed']):>16}")
     print(f"  {'Win rate':<24} {f"{allowance_summary['wr']:.1f}%":>14} {f"{legacy_summary['wr']:.1f}%":>16}")
     print(f"  {'Return':<24} {f"{allowance_summary['ret_pct']:+.1f}%":>14} {f"{legacy_summary['ret_pct']:+.1f}%":>16}")
-    print(f"  {'Max drawdown':<24} {f"{allowance_summary['max_dd']:.1f}%":>14} {f"{legacy_summary['max_dd']:.1f}%":>16}")
+    print(f"  {'DD (trading bankroll)':<24} {f"{allowance_summary['max_dd_trading']:.1f}%":>14} {f"{legacy_summary['max_dd_trading']:.1f}%":>16}")
+    print(f"  {'DD (net equity)':<24} {f"{allowance_summary['max_dd_net']:.1f}%":>14} {f"{legacy_summary['max_dd_net']:.1f}%":>16}")
     print(f"  {'Final cash':<24} {f"${allowance_summary['final_cash']:.2f}":>14} {f"${legacy_summary['final_cash']:.2f}":>16}")
+    print(f"  {'Withdrawn':<24} {f"${allowance_summary['withdrawn_total']:.2f}":>14} {f"${legacy_summary['withdrawn_total']:.2f}":>16}")
+    print(f"  {'Net equity':<24} {f"${allowance_summary['net_equity']:.2f}":>14} {f"${legacy_summary['net_equity']:.2f}":>16}")
     print(f"  {'Profit factor':<24} {f"{allowance_summary['gw']/max(allowance_summary['gl'],0.01):.2f}x":>14} {f"{legacy_summary['gw']/max(legacy_summary['gl'],0.01):.2f}x":>16}")
     print("=" * 86)
 
@@ -753,6 +921,10 @@ def main():
     parser = argparse.ArgumentParser(description="KXBTC15M sizing backtest")
     parser.add_argument("--allowance-pct", type=float, default=20.0,
                         help="Percent of bankroll allocated per wager (default: 20)")
+    parser.add_argument("--reset-trigger", type=float, default=RESET_TRIGGER_DEFAULT,
+                        help="If >0 and bankroll reaches this level, skim and reset bankroll (default: disabled)")
+    parser.add_argument("--reset-to", type=float, default=RESET_TO_DEFAULT,
+                        help="Bankroll to continue trading with after skim/reset (default: 200)")
     parser.add_argument("--sizing-mode", choices=["allowance", "legacy-kelly", "compare"], default="allowance",
                         help="Backtest sizing model: live-matching allowance, legacy Kelly, or side-by-side compare")
     args = parser.parse_args()
@@ -786,13 +958,43 @@ def main():
     if args.sizing_mode == 'compare':
         allowance_records = [r.copy() for r in records]
         legacy_records    = [r.copy() for r in records]
-        allowance_summary = summarize_run(markets, allowance_records, simulate(allowance_records, 'allowance'), 'allowance')
-        legacy_summary    = summarize_run(markets, legacy_records, simulate(legacy_records, 'legacy-kelly'), 'legacy-kelly')
+        allowance_final, allowance_withdrawn, allowance_resets = simulate(
+            allowance_records,
+            'allowance',
+            reset_trigger=args.reset_trigger,
+            reset_to=args.reset_to,
+        )
+        legacy_final, legacy_withdrawn, legacy_resets = simulate(
+            legacy_records,
+            'legacy-kelly',
+            reset_trigger=args.reset_trigger,
+            reset_to=args.reset_to,
+        )
+        allowance_summary = summarize_run(
+            markets, allowance_records, allowance_final, 'allowance',
+            withdrawn_total=allowance_withdrawn, reset_count=allowance_resets,
+        )
+        legacy_summary    = summarize_run(
+            markets, legacy_records, legacy_final, 'legacy-kelly',
+            withdrawn_total=legacy_withdrawn, reset_count=legacy_resets,
+        )
         print_compare_summary(allowance_summary, legacy_summary)
         return
 
-    final      = simulate(records, args.sizing_mode)
-    summary    = summarize_run(markets, records, final, args.sizing_mode)
+    final, withdrawn_total, reset_count = simulate(
+        records,
+        args.sizing_mode,
+        reset_trigger=args.reset_trigger,
+        reset_to=args.reset_to,
+    )
+    summary    = summarize_run(
+        markets,
+        records,
+        final,
+        args.sizing_mode,
+        withdrawn_total=withdrawn_total,
+        reset_count=reset_count,
+    )
     executed   = summary['executed']
     skipped_rm = summary['skipped_rm']
     wins       = summary['wins']
@@ -801,7 +1003,9 @@ def main():
     strong_w   = summary['strong_w']
     skip_reasons = summary['skip_reasons']
     max_cash   = summary['max_cash']
-    max_dd     = summary['max_dd']
+    max_dd_trading = summary['max_dd_trading']
+    max_dd_net = summary['max_dd_net']
+    max_net_equity = summary['max_net_equity']
     max_ws     = summary['max_ws']
     max_ls     = summary['max_ls']
     wr         = summary['wr']
@@ -811,13 +1015,18 @@ def main():
     avg_loss   = summary['avg_loss']
     gw         = summary['gw']
     gl         = summary['gl']
+    net_pnl    = summary['net_pnl']
+    net_equity = summary['net_equity']
+    net_ret_pct = summary['net_ret_pct']
+    withdrawn_total = summary['withdrawn_total']
+    reset_count = summary['reset_count']
     period   = f"{records[0]['entry_dt'][:16]} → {records[-1]['entry_dt'][:16]} UTC"
 
     W = 108
     print("\n" + "=" * W)
     print(f"  DIRECTIONAL MODEL  ·  KXBTC15M  ·  {DAYS_BACK}-day  ·  ${STARTING_CASH:.0f} start  ·  {period}")
     price_gate_str = f"entry≤{MAX_ENTRY_PRICE_RM}¢ (market efficiency)" if MAX_ENTRY_PRICE_RM > 0 else "no price gate"
-    print(f"  Filters: Markov gap≥{MARKOV_MIN_GAP} · 6-9min · Hurst>{MIN_HURST} · vel<{VEL_SAFETY_RATIO:.0%}×cross · vol≤{MAX_VOL_MULT}×ref · {price_gate_str}")
+    print(f"  Filters: Markov gap≥{MARKOV_MIN_GAP} · 6-9min · ER≥{MIN_EFFICIENCY_RATIO:.2f} · vel<{VEL_SAFETY_RATIO:.0%}×cross · vol≤{MAX_VOL_MULT}×ref · {price_gate_str}")
     print("=" * W)
     if args.sizing_mode == 'legacy-kelly':
         print(f"  {'Sizing: legacy Kelly':<40} {'edge-scaled + price tier':>24}")
@@ -841,8 +1050,14 @@ def main():
     print(f"  {'Final cash':<40} ${final:>8.2f}")
     print(f"  {'Total P&L':<40} ${pnl:>+8.2f}")
     print(f"  {'Return':<40} {ret_pct:>+7.1f}%")
-    print(f"  {'Max drawdown':<40} {max_dd:>7.1f}%")
-    print(f"  {'Peak balance':<40} ${max_cash:>8.2f}")
+    print(f"  {'Withdrawn profits':<40} ${withdrawn_total:>8.2f}  ({reset_count} resets)")
+    print(f"  {'Net equity (cash+withdrawn)':<40} ${net_equity:>8.2f}")
+    print(f"  {'Net P&L':<40} ${net_pnl:>+8.2f}")
+    print(f"  {'Net return':<40} {net_ret_pct:>+7.1f}%")
+    print(f"  {'Max drawdown (trading bankroll)':<40} {max_dd_trading:>7.1f}%")
+    print(f"  {'Max drawdown (net equity)':<40} {max_dd_net:>7.1f}%")
+    print(f"  {'Peak trading bankroll':<40} ${max_cash:>8.2f}")
+    print(f"  {'Peak net equity':<40} ${max_net_equity:>8.2f}")
     # ── Price bucket breakdown ────────────────────────────────────────────────
     buckets = [(0,65,'<65¢'),(65,73,'65-73¢'),(73,79,'73-79¢'),(79,85,'79-85¢'),(85,100,'85+¢')]
     print()
@@ -863,7 +1078,7 @@ def main():
 
     print("  TRADE LOG")
     hdr = (f"  {'#':<4} {'Entry (UTC)':<17} {'S':<3} {'LP¢':>4} {'Min':>4} "
-           f"{'pYes':>6} {'Pers':>5} {'RSI':>5} {'Hurst':>5} "
+            f"{'pYes':>6} {'Pers':>5} {'RSI':>5} {'ER':>5} "
            f"{'Spot':>9} {'Strike':>9} {'Dist%':>6} "
            f"{'Ctrs':>4} {'PnL':>8} {'Bal':>9}  Result")
     print(hdr)
@@ -875,7 +1090,8 @@ def main():
         oc    = r.get('outcome_sim', r['outcome'])
         sig   = "★" if r.get('enter_signal') else " "
         icon  = "✓ WIN" if oc == 'WIN' else "✗ LOSS"
-        h_str = f"{r['hurst']:.2f}" if r.get('hurst') is not None else "  -  "
+        er_val = r.get('efficiency_ratio', r.get('hurst'))
+        h_str = f"{er_val:.2f}" if er_val is not None else "  -  "
         r_str = f"{r['rsi']:.0f}" if r.get('rsi') is not None else "  -"
         print(f"  {n:<4} {r['entry_dt'][5:16].replace('T',' '):<17} {r['side']:<3} "
               f"{r['limit_price_cents']:>4} {r['minutes_left']:>4.1f} "
