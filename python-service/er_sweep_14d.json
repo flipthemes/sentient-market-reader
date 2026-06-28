@@ -1,0 +1,116 @@
+{
+  "days": 14,
+  "tested": 30,
+  "top10": [
+    {
+      "er_period": 10,
+      "min_er": 0.24,
+      "score": 9222.457,
+      "trades": 222,
+      "wr": 91.0,
+      "net_ret": 820.9,
+      "max_dd": 8.1,
+      "pf": 3.9
+    },
+    {
+      "er_period": 10,
+      "min_er": 0.2,
+      "score": 7618.286,
+      "trades": 243,
+      "wr": 90.9,
+      "net_ret": 880.0,
+      "max_dd": 10.5,
+      "pf": 3.61
+    },
+    {
+      "er_period": 10,
+      "min_er": 0.28,
+      "score": 7599.935,
+      "trades": 191,
+      "wr": 90.1,
+      "net_ret": 674.8,
+      "max_dd": 8.0,
+      "pf": 3.54
+    },
+    {
+      "er_period": 6,
+      "min_er": 0.24,
+      "score": 7179.318,
+      "trades": 230,
+      "wr": 89.6,
+      "net_ret": 761.2,
+      "max_dd": 9.5,
+      "pf": 3.12
+    },
+    {
+      "er_period": 12,
+      "min_er": 0.2,
+      "score": 6894.117,
+      "trades": 226,
+      "wr": 87.2,
+      "net_ret": 648.3,
+      "max_dd": 8.2,
+      "pf": 2.52
+    },
+    {
+      "er_period": 14,
+      "min_er": 0.2,
+      "score": 6822.317,
+      "trades": 206,
+      "wr": 89.3,
+      "net_ret": 672.3,
+      "max_dd": 8.8,
+      "pf": 3.09
+    },
+    {
+      "er_period": 6,
+      "min_er": 0.2,
+      "score": 6653.454,
+      "trades": 255,
+      "wr": 89.4,
+      "net_ret": 826.1,
+      "max_dd": 11.1,
+      "pf": 2.96
+    },
+    {
+      "er_period": 6,
+      "min_er": 0.28,
+      "score": 6458.215,
+      "trades": 216,
+      "wr": 88.9,
+      "net_ret": 697.4,
+      "max_dd": 9.6,
+      "pf": 3.04
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.2,
+      "score": 6314.225,
+      "trades": 257,
+      "wr": 89.5,
+      "net_ret": 846.6,
+      "max_dd": 12.0,
+      "pf": 3.14
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.32,
+      "score": 5771.575,
+      "trades": 187,
+      "wr": 92.0,
+      "net_ret": 708.9,
+      "max_dd": 11.3,
+      "pf": 4.0
+    }
+  ],
+  "best": {
+    "er_period": 10,
+    "min_er": 0.24,
+    "score": 9222.457,
+    "trades": 222,
+    "wr": 91.0,
+    "net_ret": 820.9,
+    "max_dd": 8.1,
+    "pf": 3.9
+  }
+}

@@ -31,11 +31,11 @@ import { KALSHI_HOST, getCurrentEventTicker, parseKXBTC15MCloseMs } from './kals
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const TARGET_MINUTES_BEFORE_CLOSE = 14  // start monitoring 14 min before close (1 min into each 15-min window)
-const MIN_MINUTES_LEFT       = 2         // safety floor: don't trade with < 2 min left
+const MIN_MINUTES_LEFT       = Number(process.env.MIN_MINUTES_LEFT ?? '3')
 const POST_WINDOW_BUFFER_MS  = 5_000
-const MIN_FAST_ENTRY_PRICE     = 55   // ¢ — matches risk manager floor
-const MAX_FAST_ENTRY_PRICE_YES = 72   // ¢ — YES: all buckets ≤72¢ are +EV in live data
-const MAX_FAST_ENTRY_PRICE_NO  = 68   // ¢ — NO: 65¢+ is -EV (consensus-following, bad payout ratio)
+const MIN_FAST_ENTRY_PRICE     = Number(process.env.MIN_ENTRY_PRICE_RM ?? '0')
+const MAX_FAST_ENTRY_PRICE_YES = Number(process.env.MAX_ENTRY_PRICE_YES ?? '72')
+const MAX_FAST_ENTRY_PRICE_NO  = Number(process.env.MAX_ENTRY_PRICE_NO ?? '65')
 
 // Kalshi maker fee: ceil(0.0175 × C × P × (1-P)) — agent places resting limit orders
 const MAKER_FEE_RATE = 0.0175

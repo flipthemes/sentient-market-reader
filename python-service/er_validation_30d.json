@@ -1,0 +1,75 @@
+{
+  "days": 30,
+  "results": [
+    {
+      "er_period": 8,
+      "min_er": 0.24,
+      "score": 8463.562,
+      "trades": 447,
+      "wr": 89.5,
+      "net_ret": 1456.3,
+      "max_dd": 15.4,
+      "pf": 3.04
+    },
+    {
+      "er_period": 10,
+      "min_er": 0.24,
+      "score": 8338.749,
+      "trades": 403,
+      "wr": 89.1,
+      "net_ret": 1319.6,
+      "max_dd": 14.1,
+      "pf": 3.1
+    },
+    {
+      "er_period": 10,
+      "min_er": 0.2,
+      "score": 5694.764,
+      "trades": 435,
+      "wr": 88.5,
+      "net_ret": 1351.3,
+      "max_dd": 21.0,
+      "pf": 2.81
+    },
+    {
+      "er_period": 10,
+      "min_er": 0.28,
+      "score": 4665.446,
+      "trades": 361,
+      "wr": 88.6,
+      "net_ret": 1137.4,
+      "max_dd": 21.6,
+      "pf": 2.89
+    },
+    {
+      "er_period": 10,
+      "min_er": 0.3,
+      "score": 4476.709,
+      "trades": 345,
+      "wr": 88.4,
+      "net_ret": 1073.6,
+      "max_dd": 21.2,
+      "pf": 2.84
+    },
+    {
+      "er_period": 12,
+      "min_er": 0.24,
+      "score": 3957.459,
+      "trades": 370,
+      "wr": 87.6,
+      "net_ret": 1075.2,
+      "max_dd": 23.8,
+      "pf": 2.55
+    }
+  ],
+  "best": {
+    "er_period": 8,
+    "min_er": 0.24,
+    "score": 8463.562,
+    "trades": 447,
+    "wr": 89.5,
+    "net_ret": 1456.3,
+    "max_dd": 15.4,
+    "pf": 3.04
+  }
+}

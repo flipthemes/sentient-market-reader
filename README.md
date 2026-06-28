@@ -129,6 +129,8 @@ The core momentum signal. 9-state model of 1-min BTC % price changes (large down
 
 All five execution paths enforce the same rules.
 
+Tuning guide: see `docs/configuration-reference.md` for centralized `.env.local` variables and where each knob is consumed.
+
 | Parameter | Value |
 |---|---|
 | Entry price cap — YES | ≤ 72¢ |

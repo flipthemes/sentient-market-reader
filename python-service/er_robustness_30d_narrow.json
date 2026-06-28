@@ -1,0 +1,361 @@
+{
+  "days": 30,
+  "tested": 15,
+  "best": {
+    "er_period": 8,
+    "min_er": 0.25,
+    "score": 8969.004,
+    "trades": 440,
+    "wr": 89.8,
+    "net_ret": 1468.2,
+    "max_dd": 14.7,
+    "pf": 3.16,
+    "time_buckets": {
+      "9-6m": {
+        "trades": 183,
+        "wr": 83.1,
+        "pnl": 803.36
+      },
+      "6-3m": {
+        "trades": 257,
+        "wr": 94.6,
+        "pnl": 2133.65
+      }
+    }
+  },
+  "top10": [
+    {
+      "er_period": 8,
+      "min_er": 0.25,
+      "score": 8969.004,
+      "trades": 440,
+      "wr": 89.8,
+      "net_ret": 1468.2,
+      "max_dd": 14.7,
+      "pf": 3.16,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 183,
+          "wr": 83.1,
+          "pnl": 803.36
+        },
+        "6-3m": {
+          "trades": 257,
+          "wr": 94.6,
+          "pnl": 2133.65
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.26,
+      "score": 8893.373,
+      "trades": 434,
+      "wr": 89.9,
+      "net_ret": 1454.2,
+      "max_dd": 14.7,
+      "pf": 3.18,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 179,
+          "wr": 83.2,
+          "pnl": 798.14
+        },
+        "6-3m": {
+          "trades": 255,
+          "wr": 94.5,
+          "pnl": 2110.82
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.22,
+      "score": 8865.815,
+      "trades": 465,
+      "wr": 89.0,
+      "net_ret": 1504.2,
+      "max_dd": 15.1,
+      "pf": 3.04,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 202,
+          "wr": 81.7,
+          "pnl": 798.73
+        },
+        "6-3m": {
+          "trades": 263,
+          "wr": 94.7,
+          "pnl": 2210.25
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.24,
+      "score": 8713.72,
+      "trades": 447,
+      "wr": 89.5,
+      "net_ret": 1460.4,
+      "max_dd": 15.0,
+      "pf": 3.06,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 188,
+          "wr": 82.4,
+          "pnl": 746.49
+        },
+        "6-3m": {
+          "trades": 259,
+          "wr": 94.6,
+          "pnl": 2174.91
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.23,
+      "score": 8540.919,
+      "trades": 452,
+      "wr": 88.9,
+      "net_ret": 1441.1,
+      "max_dd": 15.0,
+      "pf": 2.96,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 192,
+          "wr": 81.2,
+          "pnl": 698.28
+        },
+        "6-3m": {
+          "trades": 260,
+          "wr": 94.6,
+          "pnl": 2184.5
+        }
+      }
+    },
+    {
+      "er_period": 9,
+      "min_er": 0.26,
+      "score": 7839.956,
+      "trades": 390,
+      "wr": 88.7,
+      "net_ret": 1255.1,
+      "max_dd": 14.2,
+      "pf": 3.01,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 169,
+          "wr": 81.1,
+          "pnl": 657.82
+        },
+        "6-3m": {
+          "trades": 221,
+          "wr": 94.6,
+          "pnl": 1852.92
+        }
+      }
+    },
+    {
+      "er_period": 9,
+      "min_er": 0.23,
+      "score": 7678.725,
+      "trades": 424,
+      "wr": 88.7,
+      "net_ret": 1367.8,
+      "max_dd": 15.8,
+      "pf": 2.99,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 186,
+          "wr": 81.2,
+          "pnl": 752.31
+        },
+        "6-3m": {
+          "trades": 238,
+          "wr": 94.5,
+          "pnl": 1983.78
+        }
+      }
+    },
+    {
+      "er_period": 9,
+      "min_er": 0.24,
+      "score": 7532.202,
+      "trades": 415,
+      "wr": 88.7,
+      "net_ret": 1341.7,
+      "max_dd": 15.8,
+      "pf": 3.01,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 182,
+          "wr": 80.8,
+          "pnl": 717.93
+        },
+        "6-3m": {
+          "trades": 233,
+          "wr": 94.8,
+          "pnl": 1966.1
+        }
+      }
+    },
+    {
+      "er_period": 9,
+      "min_er": 0.22,
+      "score": 7403.147,
+      "trades": 420,
+      "wr": 88.6,
+      "net_ret": 1320.2,
+      "max_dd": 15.8,
+      "pf": 2.85,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 183,
+          "wr": 80.9,
+          "pnl": 678.82
+        },
+        "6-3m": {
+          "trades": 237,
+          "wr": 94.5,
+          "pnl": 1962.02
+        }
+      }
+    },
+    {
+      "er_period": 9,
+      "min_er": 0.25,
+      "score": 7373.235,
+      "trades": 404,
+      "wr": 88.6,
+      "net_ret": 1289.9,
+      "max_dd": 15.5,
+      "pf": 2.97,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 174,
+          "wr": 80.5,
+          "pnl": 631.74
+        },
+        "6-3m": {
+          "trades": 230,
+          "wr": 94.8,
+          "pnl": 1948.61
+        }
+      }
+    }
+  ],
+  "near_best_count": 5,
+  "near_best": [
+    {
+      "er_period": 8,
+      "min_er": 0.25,
+      "score": 8969.004,
+      "trades": 440,
+      "wr": 89.8,
+      "net_ret": 1468.2,
+      "max_dd": 14.7,
+      "pf": 3.16,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 183,
+          "wr": 83.1,
+          "pnl": 803.36
+        },
+        "6-3m": {
+          "trades": 257,
+          "wr": 94.6,
+          "pnl": 2133.65
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.26,
+      "score": 8893.373,
+      "trades": 434,
+      "wr": 89.9,
+      "net_ret": 1454.2,
+      "max_dd": 14.7,
+      "pf": 3.18,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 179,
+          "wr": 83.2,
+          "pnl": 798.14
+        },
+        "6-3m": {
+          "trades": 255,
+          "wr": 94.5,
+          "pnl": 2110.82
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.22,
+      "score": 8865.815,
+      "trades": 465,
+      "wr": 89.0,
+      "net_ret": 1504.2,
+      "max_dd": 15.1,
+      "pf": 3.04,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 202,
+          "wr": 81.7,
+          "pnl": 798.73
+        },
+        "6-3m": {
+          "trades": 263,
+          "wr": 94.7,
+          "pnl": 2210.25
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.24,
+      "score": 8713.72,
+      "trades": 447,
+      "wr": 89.5,
+      "net_ret": 1460.4,
+      "max_dd": 15.0,
+      "pf": 3.06,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 188,
+          "wr": 82.4,
+          "pnl": 746.49
+        },
+        "6-3m": {
+          "trades": 259,
+          "wr": 94.6,
+          "pnl": 2174.91
+        }
+      }
+    },
+    {
+      "er_period": 8,
+      "min_er": 0.23,
+      "score": 8540.919,
+      "trades": 452,
+      "wr": 88.9,
+      "net_ret": 1441.1,
+      "max_dd": 15.0,
+      "pf": 2.96,
+      "time_buckets": {
+        "9-6m": {
+          "trades": 192,
+          "wr": 81.2,
+          "pnl": 698.28
+        },
+        "6-3m": {
+          "trades": 260,
+          "wr": 94.6,
+          "pnl": 2184.5
+        }
+      }
+    }
+  ]
+}

@@ -12,6 +12,25 @@ if (!g._riskLastResetDate) g._riskLastResetDate = new Date().toDateString()
 
 const sessionState = g._riskSessionState
 
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name]
+  const n = raw == null ? NaN : Number(raw)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function envIntSet(name: string, fallback: number[]): Set<number> {
+  const raw = process.env[name]
+  if (!raw) return new Set(fallback)
+  const vals = raw
+    .split(',')
+    .map(s => Number(s.trim()))
+    .filter(v => Number.isFinite(v))
+    .map(v => Math.trunc(v))
+  return vals.length ? new Set(vals) : new Set(fallback)
+}
+
+const LT65_MIN_GAP = envNumber('LT65_MIN_GAP', 0.14)
+
 export function checkDailyReset(): void {
   const today = new Date().toDateString()
   if (today !== g._riskLastResetDate) {
@@ -39,7 +58,7 @@ const RISK_PARAMS = {
   minDistancePct:   0.04,  // skip near-ATM trades — backtest: 0.05 gives 336 trades @76.8% WR vs 0.10 gives 173 @85% (more volume, better absolute return)
   minEntryPrice:     0,    // no floor — 62¢ and 71¢ zones both profitable
   maxEntryPriceYes: 72,    // ¢ — YES: live data shows YES 55-72¢ all +EV; YES 72¢+ = -$9.34/trade 
-  maxEntryPriceNo:  65,    // ¢ — NO cap lower: NO 65-72¢ = -$7.71/trade (53% WR vs 69% needed). Above 65¢ NO is consensus-following with bad payout. **I CHANGED IT TO +2**
+  maxEntryPriceNo:  72,    // ¢ — NO cap lower: NO 65-72¢ = -$7.71/trade (53% WR vs 69% needed). Above 65¢ NO is consensus-following with bad payout. **I CHANGED IT TO +2**
   maxTradePct:      15,    // % of portfolio per trade
 }
 // Computed giveback limit: how far (in $) today's P&L can fall from its peak before we stop.
@@ -97,7 +116,7 @@ export function runRiskManager(
   // Hours 11, 18: catastrophically bad from 2,690 live fills (-57pp/-40pp margin).
   // Hours 8, 16, 21: added from 147-fill Apr 19-22 dataset — 44%/36%/40% WR vs 68% overall.
   // 8 UTC = EU open noise; 16 UTC = US pre-close turbulence; 21 UTC = thin late-US liquidity.
-  const BLOCKED_UTC_HOURS = new Set([8, 11, 16, 18, 21])
+  const BLOCKED_UTC_HOURS = envIntSet('BLOCKED_UTC_HOURS', [8, 11, 16, 18, 21])
   const utcHour = new Date().getUTCHours()
 
   // Time gate params differ by market type
@@ -106,6 +125,9 @@ export function runRiskManager(
   const minMin = isHourly ? 10 : RISK_PARAMS.minMinutesLeft
   const maxMin = isHourly ? 45 : RISK_PARAMS.maxMinutesLeft
   const maxTrades = isHourly ? 24 : RISK_PARAMS.maxTradesPerDay
+  const markovGap  = (markov && markov.historyLength >= 20)
+    ? Math.abs(markov.pHatYes - 0.5)
+    : Math.abs((recommendation === 'NO' ? (1 - pModel) : pModel) - 0.5)
 
   if (recommendation === 'NO_TRADE') {
     approved = false
@@ -134,6 +156,9 @@ export function runRiskManager(
   } else if (recommendation === 'NO' && limitPrice > (maxEntryPriceOverride ?? RISK_PARAMS.maxEntryPriceNo)) {
     approved = false
     rejectionReason = `BUY NO entry price ${limitPrice}¢ above max ${maxEntryPriceOverride ?? RISK_PARAMS.maxEntryPriceNo}¢ — NO 65¢+ is consensus-following with bad payout (53% WR vs 69% needed in live data)`
+  } else if (limitPrice < 65 && markovGap < LT65_MIN_GAP) {
+    approved = false
+    rejectionReason = `Low-price confidence too weak (${(markovGap * 100).toFixed(1)}% gap) — <65¢ requires ${(LT65_MIN_GAP * 100).toFixed(1)}%+`
   } else if (edgePct < RISK_PARAMS.minEdgePct) {
     approved = false
     rejectionReason = `After-fee EV ${edgePct.toFixed(2)}% < minimum ${RISK_PARAMS.minEdgePct}% — insufficient edge to overcome variance`
@@ -162,9 +187,6 @@ export function runRiskManager(
   const netWinPerC     = (1 - p_dollars) - feePerContract
   const totalCostPerC  = p_dollars + feePerContract
 
-  const markovGap  = (markov && markov.historyLength >= 20)
-    ? Math.abs(markov.pHatYes - 0.5)
-    : Math.abs((recommendation === 'NO' ? (1 - pModel) : pModel) - 0.5)
   const riskPct    = Math.min(0.05, 0.01 + 0.08 * Math.max(0, markovGap - 0.15))
   // Scale down position when vol is elevated vs baseline (0.002 per 15-min candle).
   // At 2× baseline vol, position halves. At 0.5× baseline, position is uncapped (clamped to 1.0).

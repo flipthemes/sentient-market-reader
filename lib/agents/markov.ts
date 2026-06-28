@@ -58,13 +58,13 @@ const MAX_TRADE_PCT    = 0.15
 const REFERENCE_VOL    = 0.002
 const BASE_BANKROLL    = 200    // starting bankroll the 25-contract cap was calibrated at
 const BASE_ORDER_CAP   = 25     // contracts at BASE_BANKROLL
-const MIN_GAP        = 0.11   // |pYes − 0.5| must be ≥ this — matches backtest gate
-const PERSIST_TAU    = 0.80   // momentum self-persistence threshold (mirrors chain.ts)
+const MIN_GAP        = Number(process.env.MARKOV_MIN_GAP ?? process.env.NEXT_PUBLIC_MARKOV_MIN_GAP ?? '0.11')
+const PERSIST_TAU    = Number(process.env.MIN_PERSIST ?? process.env.NEXT_PUBLIC_MIN_PERSIST ?? '0.82')
 
 function getMaxVolMult(): number {
   const raw = process.env.MAX_VOL_MULT ?? process.env.NEXT_PUBLIC_MAX_VOL_MULT
   const n = raw ? Number(raw) : NaN
-  return Number.isFinite(n) && n > 0 ? n : 1.25
+  return Number.isFinite(n) && n > 0 ? n : 1.35
 }
 
 export function runMarkovAgent(
